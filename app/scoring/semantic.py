@@ -8,7 +8,7 @@
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from normalize import normalize
+from app.scoring.normalize import normalize
 
 _model : SentenceTransformer | None = None
 
@@ -17,8 +17,8 @@ def get_model() -> SentenceTransformer:
     global _model 
 
     if _model is None :
-        print("Loading the Model 'paraphrase-MiniLM-Layer6-version2'...")
-        _model = SentenceTransformer("paraphrase-MiniLM-L6-v2")
+        print("Loading the Model 'paraphrase-MiniLM-Layer3-version2'...")
+        _model = SentenceTransformer("paraphrase-MiniLM-L3-v2")
         print("Model Ready !")
 
     return _model

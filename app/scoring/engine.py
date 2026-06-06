@@ -1,274 +1,360 @@
 """
-AeroEval Hybrid Scoring Engine.
+AviAssess Scoring Engine — the ROUTER.
 
-Combines all three scoring signals into one final score.
+WHY this module exists:
+    Different question types are scored differently, and every answer blends a
+    content dimension with two shared dimensions (communication, confidence).
+    Rather than letting any one scorer own the final number, this module stays
+    thin: it DISPATCHES to the right content scorer, ALWAYS runs the shared
+    scorers, BLENDS them with the per-type weighting scheme, applies the
+    cross-cutting rules (skip / blank → 0), bands the FINAL score, and hands the
+    raw details to feedback.py for the explanation.
 
-Signal weights:
-    Semantic similarity  → 60%  (meaning comprehension)
-    Keyword coverage     → 25%  (critical concept coverage)
-    Fuzzy similarity     → 15%  (typo tolerance, completeness)
+The blend — and why the "general rule" matters:
+    Base weights per question type:
+        technical            → technical 0.50, communication 0.25, confidence 0.25
+        behavioral/situational → relevance 0.35, communication 0.40, confidence 0.25
 
-Why these weights?
-    Semantic is the strongest signal — it captures actual understanding.
-    Keyword ensures critical terms are present — semantic alone can be fooled.
-    Fuzzy is a supporting signal — catches edge cases, handles typos.
+    Confidence is the one dimension that can be None (text-only answer, no
+    camera/mic). We never treat "not measured" as zero. Instead the final score
+    is a weighted average over ONLY the dimensions that have a score:
 
-These weights are a starting point. After real student testing,
-you'll tune them based on observed scoring quality.
+        final = Σ(score·weight  for present dims) / Σ(weight  for present dims)
+
+    When confidence is None its weight drops out and is re-normalized
+    proportionally across the dimensions we DO have. "weights_used" in the
+    result reports the actual post-redistribution weights for transparency.
 """
 
-from semantic import semantic_similarity
-from keywords import keyword_coverage
-from fuzzy import fuzzy_similarity
+from app.scoring.technical import score_technical
+from app.scoring.behavioral import score_behavioral
+from app.scoring.communication import score_communication
+from app.scoring.confidence import score_confidence
+from app.scoring.feedback import build_feedback
 
 
 # ─────────────────────────────────────────────────────────
-# Signal weights — must sum to 1.0
-# Change these to tune scoring behavior
+# Score bands — applied to the FINAL blended score (0–100).
 # ─────────────────────────────────────────────────────────
-WEIGHT_SEMANTIC = 0.60
-WEIGHT_KEYWORD  = 0.25
-WEIGHT_FUZZY    = 0.15
+BAND_EXCELLENT = 85
+BAND_GOOD      = 70
+BAND_PARTIAL   = 50
+BAND_WEAK      = 30
+
+# ─────────────────────────────────────────────────────────
+# Base dimension weights (must sum to 1.0 within each mode).
+# ─────────────────────────────────────────────────────────
+# Technical mode: a known-answer question.
+TECH_W_TECHNICAL     = 0.50
+TECH_W_COMMUNICATION = 0.25
+TECH_W_CONFIDENCE    = 0.25
+
+# Relevance mode: behavioral / situational (no known answer).
+REL_W_RELEVANCE      = 0.35
+REL_W_COMMUNICATION  = 0.40
+REL_W_CONFIDENCE     = 0.25
+
+# Question types that have NO expected answer → relevance mode.
+RELEVANCE_TYPES = ("behavioral", "situational")
 
 
-def score_answer(
-    student_answer: str,
-    expected_answer: str,
-    essential_keywords: list[str],
-    supporting_keywords: list[str],
+def score_response(
+    question: dict,
+    student_answer_text: str,
+    behavioral_features: dict | None,
+    was_skipped: bool,
 ) -> dict:
     """
-    Score a student's answer against the expected answer.
+    Score one submitted answer end-to-end and assemble the full result.
 
     Args:
-        student_answer      : Raw text from student
-        expected_answer     : Reference answer from dataset
-        essential_keywords  : Must-have concepts
-        supporting_keywords : Nice-to-have concepts
+        question            : Dataset question dict (id, question_type, answer,
+                              essential_keywords, supporting_keywords, ...).
+        student_answer_text : The candidate's answer text.
+        behavioral_features : Browser feature blob, or None for a text-only answer.
+        was_skipped         : True if the candidate skipped this question.
 
     Returns:
-        Full scoring result dict with score, band,
-        breakdown, feedback, and keyword details.
+        The full result dict (see module docstring / return shape below).
     """
 
-    # ─────────────────────────────────────────────
-    # Guard: empty answer
-    # ─────────────────────────────────────────────
-    if not student_answer or not student_answer.strip():
-        return _empty_result()
+    question_id   = question.get("id")
+    question_type = question.get("question_type")
 
     # ─────────────────────────────────────────────
-    # Run all three scorers independently
+    # 1. SHORT-CIRCUIT: skipped, or blank/whitespace answer.
+    #    No scorer runs — we never score features for a non-answer.
+    #    Skip enforces band "skipped"; a blank-but-not-skipped answer is
+    #    simply "incorrect".
     # ─────────────────────────────────────────────
-    semantic_score = semantic_similarity(student_answer, expected_answer)
+    is_blank = not student_answer_text or not student_answer_text.strip()
+    if was_skipped or is_blank:
+        band = "skipped" if was_skipped else "incorrect"
+        return _build_result(
+            question_id=question_id,
+            question_type=question_type,
+            was_skipped=was_skipped,
+            final_percentage=0.0,
+            band=band,
+            dimension_percentages={
+                "technical": None, "relevance": None,
+                "communication": None, "confidence": None,
+            },
+            weights_used={},
+            feedback=build_feedback(
+                question_type, band, {}, None, None, None, was_skipped,
+            ),
+        )
 
-    keyword_result = keyword_coverage(
-        student_answer,
-        essential_keywords,
-        supporting_keywords,
-    )
-    keyword_score = keyword_result["score"]
-
-    fuzzy_score = fuzzy_similarity(student_answer, expected_answer)
+    text                = student_answer_text
+    essential_keywords  = question.get("essential_keywords", [])
+    supporting_keywords = question.get("supporting_keywords", [])
 
     # ─────────────────────────────────────────────
-    # Weighted combination
+    # 2. DISPATCH the content dimension by question_type.
+    #    `mode` decides BOTH the content scorer and the weight set.
     # ─────────────────────────────────────────────
-    raw_score = (
-        (WEIGHT_SEMANTIC * semantic_score) +
-        (WEIGHT_KEYWORD  * keyword_score)  +
-        (WEIGHT_FUZZY    * fuzzy_score)
-    )
+    expected_answer = question.get("answer")
+
+    if question_type == "technical" and expected_answer is not None:
+        content_detail = score_technical(
+            text, expected_answer, essential_keywords, supporting_keywords,
+        )
+        mode = "technical"
+
+    elif question_type == "technical" and expected_answer is None:
+        # DATA ERROR: a technical question must have an expected answer.
+        # Degrade gracefully — score it on relevance (theme coverage) instead
+        # of crashing. It reports under the "relevance" dimension.
+        content_detail = score_behavioral(
+            text, essential_keywords, supporting_keywords,
+        )
+        mode = "relevance"
+
+    else:
+        # behavioral / situational — and any unknown type defaults here, since
+        # relevance scoring needs no expected answer and never crashes.
+        content_detail = score_behavioral(
+            text, essential_keywords, supporting_keywords,
+        )
+        mode = "relevance"
 
     # ─────────────────────────────────────────────
-    # Length penalty
-    # Penalize one-word or very short answers
-    # to detailed questions.
-    #
-    # If the expected answer is 15+ words
-    # but student wrote fewer than 4 words,
-    # they definitely didn't explain properly.
+    # 3. ALWAYS run the shared dimensions.
     # ─────────────────────────────────────────────
-    student_word_count = len(student_answer.strip().split())
-    expected_word_count = len(expected_answer.strip().split())
+    communication_detail = score_communication(text)
+    confidence_detail    = score_confidence(behavioral_features)
 
-    if student_word_count < 4 and expected_word_count >= 15:
-        raw_score *= 0.5  # 50% penalty for too-short answers
+    # ─────────────────────────────────────────────
+    # 4. BLEND with the general (re-normalizing) rule.
+    # ─────────────────────────────────────────────
+    if mode == "technical":
+        dims = [
+            ("technical",     content_detail["score"],       TECH_W_TECHNICAL),
+            ("communication", communication_detail["score"], TECH_W_COMMUNICATION),
+            ("confidence",    confidence_detail["score"],     TECH_W_CONFIDENCE),
+        ]
+    else:
+        dims = [
+            ("relevance",     content_detail["score"],       REL_W_RELEVANCE),
+            ("communication", communication_detail["score"], REL_W_COMMUNICATION),
+            ("confidence",    confidence_detail["score"],     REL_W_CONFIDENCE),
+        ]
 
-    # Clamp final score to [0, 1]
-    final_score = max(0.0, min(1.0, raw_score))
+    # Only dimensions with a real score participate; confidence=None drops out.
+    present = [(name, score, weight) for name, score, weight in dims
+               if score is not None]
+    total_weight = sum(weight for _, _, weight in present)
 
-    # Convert to percentage
+    final_score = sum(score * weight for _, score, weight in present) / total_weight
+
+    # ─────────────────────────────────────────────
+    # 5. Convert to percentages (presentation only; math above stayed 0-1).
+    # ─────────────────────────────────────────────
     final_percentage = round(final_score * 100, 1)
 
+    dimension_percentages = {
+        "technical": None, "relevance": None,
+        "communication": None, "confidence": None,
+    }
+    for name, score, _ in dims:
+        dimension_percentages[name] = (
+            round(score * 100, 1) if score is not None else None
+        )
+
+    # Actual weights after redistribution (sum to 1.0 across present dims).
+    weights_used = {
+        name: round(weight / total_weight, 4) for name, _, weight in present
+    }
+
     # ─────────────────────────────────────────────
-    # Score band
+    # 6. BAND the FINAL blended score.
     # ─────────────────────────────────────────────
     band = _get_band(final_percentage)
 
     # ─────────────────────────────────────────────
-    # Feedback message
+    # 7. FEEDBACK from the raw details (feedback.py does no scoring).
     # ─────────────────────────────────────────────
-    feedback = _generate_feedback(
-        score=final_percentage,
+    feedback = build_feedback(
+        question_type=question_type,
         band=band,
-        essential_hit=keyword_result["essential_hit"],
-        essential_miss=keyword_result["essential_miss"],
-        supporting_hit=keyword_result["supporting_hit"],
+        dimension_scores=dimension_percentages,
+        technical_or_relevance_detail=content_detail,
+        communication_detail=communication_detail,
+        confidence_detail=confidence_detail,
+        was_skipped=False,
     )
 
-    return {
-        # Main result
-        "score": final_percentage,
-        "band": band,
-        "feedback": feedback,
-
-        # Score breakdown (useful for frontend display)
-        "breakdown": {
-            "semantic": round(semantic_score * 100, 1),
-            "keyword":  round(keyword_score  * 100, 1),
-            "fuzzy":    round(fuzzy_score    * 100, 1),
-        },
-
-        # Keyword details (useful for feedback)
-        "keywords": {
-            "essential_hit":  keyword_result["essential_hit"],
-            "essential_miss": keyword_result["essential_miss"],
-            "supporting_hit": keyword_result["supporting_hit"],
-        },
-    }
+    return _build_result(
+        question_id=question_id,
+        question_type=question_type,
+        was_skipped=False,
+        final_percentage=final_percentage,
+        band=band,
+        dimension_percentages=dimension_percentages,
+        weights_used=weights_used,
+        feedback=feedback,
+    )
 
 
 def _get_band(score: float) -> str:
-    """Map numeric score to performance band."""
-    if score >= 85:
+    """Map a 0–100 score to a performance band."""
+    if score >= BAND_EXCELLENT:
         return "excellent"
-    elif score >= 70:
+    if score >= BAND_GOOD:
         return "good"
-    elif score >= 50:
+    if score >= BAND_PARTIAL:
         return "partial"
-    elif score >= 30:
+    if score >= BAND_WEAK:
         return "weak"
-    else:
-        return "incorrect"
+    return "incorrect"
 
 
-def _generate_feedback(
-    score: float,
+def _build_result(
+    question_id,
+    question_type,
+    was_skipped: bool,
+    final_percentage: float,
     band: str,
-    essential_hit: list[str],
-    essential_miss: list[str],
-    supporting_hit: list[str],
-) -> str:
-    """
-    Generate a human-readable feedback message.
-
-    Good feedback tells students:
-    1. Overall how they did
-    2. What they got right
-    3. What they missed
-    4. What to study
-    """
-
-    # Base message by band
-    base_messages = {
-        "excellent": "Excellent answer! You demonstrated strong understanding.",
-        "good":      "Good answer. You covered the core concept well.",
-        "partial":   "Partial understanding shown. Some key concepts were missed.",
-        "weak":      "Your answer needs improvement. Review the core concepts.",
-        "incorrect": "This answer does not address the question correctly.",
-    }
-
-    feedback = base_messages[band]
-
-    # Add what they got right
-    if essential_hit:
-        hits = ", ".join(essential_hit)
-        feedback += f" You correctly mentioned: {hits}."
-
-    # Add what they missed — most valuable feedback
-    if essential_miss:
-        misses = ", ".join(essential_miss)
-        feedback += f" Key concepts to review: {misses}."
-
-    # Encourage depth if they got essentials but not supporting
-    if essential_hit and not essential_miss and not supporting_hit:
-        feedback += " Try to elaborate with more specific details."
-
-    return feedback
-
-
-def _empty_result() -> dict:
-    """Return a zero-score result for empty answers."""
+    dimension_percentages: dict,
+    weights_used: dict,
+    feedback: dict,
+) -> dict:
+    """Assemble the canonical result dict (single source of the return shape)."""
     return {
-        "score": 0.0,
-        "band": "incorrect",
-        "feedback": "No answer was provided.",
-        "breakdown": {"semantic": 0.0, "keyword": 0.0, "fuzzy": 0.0},
-        "keywords": {
-            "essential_hit": [],
-            "essential_miss": [],
-            "supporting_hit": [],
-        },
+        "question_id":   question_id,
+        "question_type": question_type,
+        "was_skipped":   was_skipped,
+        "final_score":   final_percentage,
+        "band":          band,
+        "dimensions":    dimension_percentages,
+        "weights_used":  weights_used,
+        "feedback":      feedback,
     }
 
 
 # ─────────────────────────────────────────────────────────
-# Full Demo Test
+# Full Demo — covers every path
+# Run from the PROJECT ROOT:  python -m app.scoring.engine
 # ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
 
-    question = "What is Aerodynamics?"
+    technical_question = {
+        "id": "q001",
+        "question_type": "technical",
+        "question": "What is aerodynamics?",
+        "answer": (
+            "Aerodynamics is the study of how air moves around objects and how "
+            "forces like lift and drag affect motion. It is widely used in "
+            "aircraft design to improve performance and efficiency."
+        ),
+        "essential_keywords": ["aerodynamics", "lift", "drag", "air"],
+        "supporting_keywords": ["airflow", "pressure", "efficiency"],
+    }
 
-    expected = (
-        "Aerodynamics is the study of how air moves around objects "
-        "and how forces like lift and drag affect motion. It is widely "
-        "used in aircraft, cars, and engineering design to improve "
-        "performance and efficiency."
+    behavioral_question = {
+        "id": "q050",
+        "question_type": "behavioral",
+        "question": "Tell me about yourself — why aviation?",
+        "answer": None,
+        "essential_keywords": [
+            "passion for flying", "the airline industry",
+            "hands-on aviation experience", "career goal",
+        ],
+        "supporting_keywords": [
+            "working with a crew", "commitment to safety", "travel", "career",
+        ],
+    }
+
+    situational_question = {
+        "id": "q075",
+        "question_type": "situational",
+        "question": "A passenger becomes aggressive during boarding. What do you do?",
+        "answer": None,
+        "essential_keywords": [
+            "stay calm", "ensure safety", "follow procedure", "de-escalate",
+        ],
+        "supporting_keywords": ["communicate clearly", "involve the crew"],
+    }
+
+    strong_technical_answer = (
+        "Aerodynamics is the study of how air moves around objects and how "
+        "forces such as lift and drag influence their motion. Engineers apply "
+        "it to aircraft design so that airflow stays smooth and efficient."
+    )
+    strong_behavioral_answer = (
+        "Ever since I was a child I have been fascinated by flight and the "
+        "science of how aircraft stay in the air. I spent two summers working "
+        "as part of a ground crew, which taught me how a team keeps operations "
+        "running safely. My ambition is to grow into a captain and build a long "
+        "career in the airline industry."
+    )
+    situational_answer = (
+        "First I would stay calm and speak to the passenger in a clear, "
+        "respectful tone to de-escalate the situation. My priority is the "
+        "safety of everyone on board, so I would follow the airline's procedure "
+        "and involve the rest of the crew if the behaviour continued."
     )
 
-    essential   = ["aerodynamics", "lift", "drag", "air"]
-    supporting  = ["fluid", "pressure", "efficiency", "aircraft", "airflow"]
+    full_features = {
+        "eye_contact_percent": 0.84,
+        "facial_confidence_score": 0.78,
+        "pitch_variance": 0.14,
+        "speaking_rate_wpm": 128,
+    }
+    voice_only_features = {
+        "pitch_variance": 0.22,
+        "speaking_rate_wpm": 120,
+    }
 
-    test_answers = [
-        (
-            "Aerodynamics is the study of how air moves around objects "
-            "and how forces like lift and drag affect motion.",
-            "Near perfect answer"
-        ),
-        (
-            "Aerodynamics is basically the reason some things cut through "
-            "air smoothly while others struggle against it. The better the "
-            "airflow, the faster and more efficient the movement feels.",
-            "Your example — different words, same concept"
-        ),
-        (
-            "Aerodynamics is about airflow and how planes fly.",
-            "Partially correct"
-        ),
-        (
-            "It is used in aircraft design.",
-            "Too vague"
-        ),
-        (
-            "I don't know.",
-            "Wrong answer"
-        ),
+    cases = [
+        ("1. Technical + full features",
+         technical_question, strong_technical_answer, full_features, False),
+        ("2. Technical + confidence None (text-only)",
+         technical_question, strong_technical_answer, None, False),
+        ("3. Behavioral + full features",
+         behavioral_question, strong_behavioral_answer, full_features, False),
+        ("4. Situational + partial features (voice only)",
+         situational_question, situational_answer, voice_only_features, False),
+        ("5. Skipped",
+         technical_question, "", None, True),
+        ("6. Empty answer text, not skipped",
+         technical_question, "   ", full_features, False),
     ]
 
-    print("\n" + "=" * 65)
-    print(f"  QUESTION: {question}")
-    print("=" * 65)
+    print("\n" + "=" * 74)
+    print("  FULL ROUTER — score_response()")
+    print("=" * 74)
 
-    for student_ans, label in test_answers:
-        result = score_answer(student_ans, expected, essential, supporting)
+    for label, q, answer, features, skipped in cases:
+        result = score_response(q, answer, features, skipped)
 
         print(f"\n  [{label}]")
-        print(f"  Student  : {student_ans[:70]}")
-        print(f"  Score    : {result['score']}%  ({result['band'].upper()})")
-        print(f"  Breakdown: Semantic={result['breakdown']['semantic']}%  "
-              f"Keyword={result['breakdown']['keyword']}%  "
-              f"Fuzzy={result['breakdown']['fuzzy']}%")
-        print(f"  Feedback : {result['feedback']}")
-        print(f"  Missed   : {result['keywords']['essential_miss']}")
-        print("-" * 65)
+        print(f"  question_id : {result['question_id']}  ({result['question_type']})")
+        print(f"  final_score : {result['final_score']}%   band: {result['band'].upper()}")
+        print(f"  dimensions  : {result['dimensions']}")
+        print(f"  weights_used: {result['weights_used']}")
+        print(f"  feedback    :")
+        for section, text in result["feedback"].items():
+            print(f"      {section:14}: {text}")
+        print("-" * 74)

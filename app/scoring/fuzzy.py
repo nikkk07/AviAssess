@@ -1,5 +1,5 @@
 from rapidfuzz import fuzz
-from normalize import normalize
+from app.scoring.normalize import normalize
 
 def fuzzy_similarity ( student_answer:str, expected_answer:str ) -> float :
 
