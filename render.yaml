@@ -1,0 +1,57 @@
+# Render deployment config for the AviAssess scoring service (free tier).
+#
+# Free-tier reality this file is built around:
+#   * 512 MB RAM, 0.1 vCPU, 500 build minutes/month.
+#   * torch MUST be the CPU-only wheel — the default CUDA build is huge and would
+#     blow both the build-minute and disk budgets.
+#   * The sentence-transformer is PRE-DOWNLOADED at build time into HF_HOME so a
+#     cold start (free instances spin down when idle) does NOT re-download it.
+#     HF_HOME is set as an env var so it points at the SAME path during build and
+#     runtime — otherwise the runtime would look in a different cache and refetch.
+#   * SINGLE uvicorn process (no gunicorn worker pool) to stay inside 512 MB.
+
+services:
+  - type: web
+    name: aviassess-scoring
+    runtime: python
+    plan: free
+
+    # CRITICAL build order:
+    #   1. upgrade pip
+    #   2. install CPU-only torch FIRST, from the PyTorch CPU index
+    #   3. install the rest (requirements.txt has torch commented out, so this
+    #      won't pull a second/CUDA torch — sentence-transformers uses the CPU one)
+    #   4. warm the model cache so it's on disk before the first request
+    buildCommand: |
+      pip install --upgrade pip
+      pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+      pip install -r requirements.txt
+      python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('paraphrase-MiniLM-L3-v2')"
+
+    # Single process — one worker. Render provides $PORT.
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+    envVars:
+      # Match the local interpreter so wheels resolve identically.
+      - key: PYTHON_VERSION
+        value: 3.11.15
+
+      # Same cache path at BUILD and RUNTIME so the pre-downloaded model is found.
+      - key: HF_HOME
+        value: /opt/render/project/.cache/huggingface
+
+      # Non-secret, safe to commit.
+      - key: JWT_ALGORITHM
+        value: HS256
+
+      # Secrets / per-environment — set these in the Render dashboard, NEVER commit.
+      # sync:false means Render will NOT take a value from this file; it keeps the
+      # dashboard value and won't overwrite it on deploy.
+      - key: JWT_SECRET_KEY      # MUST equal the auth service's JWT_SECRET_KEY
+        sync: false
+      - key: SESSION_SECRET      # MUST be a new, distinct value (≠ JWT_SECRET_KEY)
+        sync: false
+      - key: ALLOWED_ORIGINS     # comma-separated frontend origins, e.g. https://app.example.com
+        sync: false
+      - key: ADMIN_USER_IDS      # comma-separated admin user UUIDs (may be empty)
+        sync: false

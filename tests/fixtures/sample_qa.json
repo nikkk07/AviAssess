@@ -1,0 +1,101 @@
+[
+  {
+    "id": "q001",
+    "question": "What is aerodynamics?",
+    "question_type": "technical",
+    "answer": "Aerodynamics is the study of how air moves around objects and how forces such as lift and drag affect their motion. It is applied in aircraft design to improve performance and efficiency.",
+    "essential_keywords": ["aerodynamics", "lift", "drag", "air"],
+    "supporting_keywords": ["airflow", "pressure", "efficiency"],
+    "category": "aerodynamics",
+    "difficulty": "basic",
+    "time_limit_seconds": 90
+  },
+  {
+    "id": "q002",
+    "question": "What are the four forces of flight?",
+    "question_type": "technical",
+    "answer": "The four forces of flight are lift, weight, thrust, and drag. Lift opposes weight and thrust opposes drag, and an aircraft is in balanced flight when these forces are in equilibrium.",
+    "essential_keywords": ["lift", "weight", "thrust", "drag"],
+    "supporting_keywords": ["equilibrium", "balance", "forces"],
+    "category": "aerodynamics",
+    "difficulty": "basic",
+    "time_limit_seconds": 90
+  },
+  {
+    "id": "q003",
+    "question": "What does the rudder control on an aircraft?",
+    "question_type": "technical",
+    "answer": "The rudder controls yaw, which is the side-to-side movement of the aircraft's nose about its vertical axis. It is operated by the pilot's foot pedals and helps coordinate turns.",
+    "essential_keywords": ["rudder", "yaw", "vertical axis"],
+    "supporting_keywords": ["pedals", "turn", "coordinate"],
+    "category": "systems",
+    "difficulty": "intermediate",
+    "time_limit_seconds": 90
+  },
+  {
+    "id": "q050",
+    "question": "Tell me about yourself — why aviation?",
+    "question_type": "behavioral",
+    "answer": null,
+    "essential_keywords": ["passion for flying", "the airline industry", "hands-on aviation experience", "career goal"],
+    "supporting_keywords": ["working with a crew", "commitment to safety", "travel", "career"],
+    "category": "motivation",
+    "difficulty": "basic",
+    "time_limit_seconds": 120
+  },
+  {
+    "id": "q051",
+    "question": "Describe a time you worked effectively in a team.",
+    "question_type": "behavioral",
+    "answer": null,
+    "essential_keywords": ["working in a team", "shared responsibility", "clear communication", "a successful outcome"],
+    "supporting_keywords": ["leadership", "supporting colleagues", "under pressure"],
+    "category": "teamwork",
+    "difficulty": "intermediate",
+    "time_limit_seconds": 120
+  },
+  {
+    "id": "q052",
+    "question": "Tell me about a time you handled a difficult conflict.",
+    "question_type": "behavioral",
+    "answer": null,
+    "essential_keywords": ["a disagreement", "staying calm", "listening to others", "resolving the issue"],
+    "supporting_keywords": ["compromise", "professionalism", "a positive result"],
+    "category": "conflict",
+    "difficulty": "intermediate",
+    "time_limit_seconds": 120
+  },
+  {
+    "id": "q075",
+    "question": "A passenger becomes aggressive during boarding. What do you do?",
+    "question_type": "situational",
+    "answer": null,
+    "essential_keywords": ["stay calm", "ensure passenger safety", "follow procedure", "de-escalate the situation"],
+    "supporting_keywords": ["communicate clearly", "involve the crew", "remain professional"],
+    "category": "safety",
+    "difficulty": "intermediate",
+    "time_limit_seconds": 120
+  },
+  {
+    "id": "q076",
+    "question": "You notice a colleague skipping a safety check. How do you respond?",
+    "question_type": "situational",
+    "answer": null,
+    "essential_keywords": ["prioritise safety", "raise the concern", "follow procedure", "report appropriately"],
+    "supporting_keywords": ["speak up respectfully", "teamwork", "accountability"],
+    "category": "safety",
+    "difficulty": "advanced",
+    "time_limit_seconds": 120
+  },
+  {
+    "id": "q077",
+    "question": "A flight is delayed and passengers are frustrated. What do you do?",
+    "question_type": "situational",
+    "answer": null,
+    "essential_keywords": ["stay calm", "communicate clearly", "show empathy", "keep passengers informed"],
+    "supporting_keywords": ["offer assistance", "patience", "professionalism"],
+    "category": "service",
+    "difficulty": "intermediate",
+    "time_limit_seconds": 120
+  }
+]
