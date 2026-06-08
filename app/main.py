@@ -14,6 +14,7 @@ loaded ONCE at startup (lifespan) so the first real request doesn't pay the
 cold-start cost, and the question pool / config are held in memory.
 """
 
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -42,6 +43,7 @@ from app.data.models import (
 from app.reports.generator import aggregate_report
 from app.scoring.engine import score_response
 from app.scoring.semantic import get_model
+from app.storage import db
 from app.session import (
     SessionError,
     create_session_token,
@@ -67,8 +69,11 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Nothing to tear down (stateless service).
+    # Close the DB pool if persistence ever opened one (no-op when DB-less).
+    await db.close_pool()
 
+
+logger = logging.getLogger("aviassess")
 
 app = FastAPI(title="AviAssess Scoring Service", lifespan=lifespan)
 
@@ -228,12 +233,44 @@ async def session_complete(
     except SessionError as exc:
         raise api_error(status.HTTP_401_UNAUTHORIZED, "invalid_session", str(exc))
 
-    report = aggregate_report([r.model_dump() for r in body.results])
+    results = [r.model_dump() for r in body.results]
+    report = aggregate_report(results)
+
+    # Persist the finished interview — but ONLY if a DATABASE_URL is configured.
+    # When it's unset we skip silently and the service stays fully DB-less.
+    # A DB hiccup must NOT cost the candidate their already-computed report, so a
+    # save failure is logged and swallowed rather than turned into a 500.
+    if db.is_configured():
+        try:
+            await db.save_interview(
+                user_id=user_id,
+                results=results,
+                total_score=report["total_score"],
+                overall_band=report["overall_band"],
+                num_questions=report["num_questions"],
+                num_skipped=report["num_skipped"],
+            )
+        except Exception:  # noqa: BLE001 — best-effort persistence, never fatal
+            logger.exception("Failed to persist interview for user %s", user_id)
+
     return SessionCompleteResponse(**report)
 
 
 # ─────────────────────────────────────────────────────────
-# 5. Admin config — read (any authed user) / write (admins only).
+# 5. Interview history — the caller's own past interviews.
+# ─────────────────────────────────────────────────────────
+@app.get("/api/interviews")
+async def list_interviews(
+    user_id: uuid.UUID = Depends(get_current_user_id),
+) -> list[dict]:
+    # DB-less deployment: no persistence, so the history is simply empty.
+    if not db.is_configured():
+        return []
+    return await db.get_user_interviews(user_id)
+
+
+# ─────────────────────────────────────────────────────────
+# 6. Admin config — read (any authed user) / write (admins only).
 # ─────────────────────────────────────────────────────────
 @app.get("/api/admin/config", response_model=AdminConfigResponse)
 async def admin_config_get(

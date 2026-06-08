@@ -31,6 +31,9 @@ services:
     # Single process — one worker. Render provides $PORT.
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
+    # Health check — pings /api/health (200 OK) instead of "/" (which 404s).
+    healthCheckPath: /api/health
+
     envVars:
       # Match the local interpreter so wheels resolve identically.
       - key: PYTHON_VERSION
@@ -54,4 +57,6 @@ services:
       - key: ALLOWED_ORIGINS     # comma-separated frontend origins, e.g. https://app.example.com
         sync: false
       - key: ADMIN_USER_IDS      # comma-separated admin user UUIDs (may be empty)
+        sync: false
+      - key: DATABASE_URL        # Supabase pooler connection string; optional — if unset, runs DB-less
         sync: false

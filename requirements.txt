@@ -58,3 +58,8 @@ six==1.17.0
 starlette==1.2.1
 typing-inspection==0.4.2
 uvicorn
+
+# Results persistence (Phase 5) — raw asyncpg + parameterized SQL ONLY.
+# Deliberately NO SQLAlchemy / supabase-py / boto3: this service runs in 512MB
+# and we just validated the fit, so we keep the dependency footprint minimal.
+asyncpg==0.30.0

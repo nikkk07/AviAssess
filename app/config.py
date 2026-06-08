@@ -13,6 +13,8 @@ CRITICAL for auth:
     so a matching secret + matching algorithm is what makes signatures line up.
 """
 
+from typing import Optional
+
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -44,6 +46,20 @@ class Settings(BaseSettings):
     # ─────────────────────────────────────────────
     QUESTIONS_PATH: str = "tests/fixtures/sample_qa.json"
     CONFIG_PATH: str = "config.json"
+
+    # ─────────────────────────────────────────────
+    # Results persistence (Phase 5 — OPTIONAL).
+    # DATABASE_URL points at the SAME Supabase Postgres the auth service uses.
+    # If it's UNSET, persistence is skipped entirely and the service still runs
+    # DB-less (start a session, score answers, get a report — just nothing saved).
+    #
+    # IMPORTANT: use the Supabase POOLER connection string (port 6543), NOT the
+    # direct connection (port 5432). This service spins down when idle and
+    # reconnects on cold start; the pooler (PgBouncer) is built for that churn of
+    # short-lived connections, whereas direct 5432 connections are a limited
+    # resource that this on-demand service would exhaust.
+    # ─────────────────────────────────────────────
+    DATABASE_URL: Optional[str] = None
 
     # ─────────────────────────────────────────────
     # CORS + admin gating. These arrive as comma-separated strings (env vars
