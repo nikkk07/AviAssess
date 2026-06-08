@@ -41,3 +41,5 @@ htmlcov/
 # Precomputed data (we'll regenerate in CI)
 *.npy
 *.pkl
+
+frontend/
