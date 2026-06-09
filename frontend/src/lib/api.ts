@@ -141,6 +141,15 @@ export function getHealth({ timeoutMs = 20000 } = {}): Promise<{ status?: string
   return call("/api/health", { timeoutMs });
 }
 
+/**
+ * DEV-ONLY fixed-code login. Trades a fixed code for a real, server-minted
+ * access token (the JWT_SECRET_KEY never touches the browser). The route only
+ * exists when DEV_LOGIN_ENABLED is set on the server — otherwise it 404s.
+ */
+export function devLogin(code: string): Promise<{ access_token: string }> {
+  return call("/api/dev/login", { method: "POST", body: { code } });
+}
+
 /** Begin a session → { session_token, questions, issued_at }. */
 export function startSession(
   token: string,

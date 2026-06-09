@@ -68,6 +68,17 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = "http://localhost:3000"
     ADMIN_USER_IDS: str = ""  # comma-separated UUIDs allowed to write config
 
+    # ─────────────────────────────────────────────
+    # DEV-ONLY fixed-code login (OFF by default).
+    # When DEV_LOGIN_ENABLED is False the /api/dev/login route 404s, so prod
+    # behaves as if it doesn't exist. Lets devs swap a 6-digit code for a real
+    # server-minted access token instead of hand-minting JWTs. Never enable in
+    # committed files; set these via the environment only.
+    # ─────────────────────────────────────────────
+    DEV_LOGIN_ENABLED: bool = False
+    DEV_LOGIN_CODE: str = ""
+    DEV_LOGIN_USER_ID: str = "00000000-0000-0000-0000-000000000001"
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]

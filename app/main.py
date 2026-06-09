@@ -17,12 +17,14 @@ cold-start cost, and the question pool / config are held in memory.
 import logging
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, status
 from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from jose import jwt
+from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.auth import get_current_user_id
@@ -122,6 +124,30 @@ async def health() -> HealthResponse:
         status="ok",
         model_loaded=getattr(app.state, "model_loaded", False),
     )
+
+
+# ─────────────────────────────────────────────────────────
+# 1b. DEV-ONLY fixed-code login (OFF by default — see config.py).
+# Swaps a fixed 6-digit code for a real, server-minted access token so devs
+# don't hand-mint JWTs. The JWT_SECRET_KEY never leaves the server. When
+# disabled the route 404s, so prod looks like it doesn't exist.
+# ─────────────────────────────────────────────────────────
+class DevLoginRequest(BaseModel):
+    code: str
+
+
+@app.post("/api/dev/login")
+async def dev_login(body: DevLoginRequest):
+    # When disabled, 404 so prod looks like the route doesn't exist.
+    if not settings.DEV_LOGIN_ENABLED:
+        raise api_error(status.HTTP_404_NOT_FOUND, "not_found", "Not found")
+    if not settings.DEV_LOGIN_CODE or body.code != settings.DEV_LOGIN_CODE:
+        raise api_error(status.HTTP_401_UNAUTHORIZED, "invalid_code", "Incorrect dev code")
+    token = jwt.encode(
+        {"sub": settings.DEV_LOGIN_USER_ID, "type": "access",
+         "exp": datetime.now(timezone.utc) + timedelta(hours=24)},
+        settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    return {"access_token": token, "token_type": "bearer"}
 
 
 # ─────────────────────────────────────────────────────────

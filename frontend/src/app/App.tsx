@@ -5,10 +5,12 @@ import { Mic, Plane, ArrowRight, CheckCircle, RefreshCcw, AlertCircle, Scan, Act
 import {
   API_BASE_URL,
   getHealth,
+  devLogin,
   startSession,
   submitAnswer,
   completeSession,
   isAuthError,
+  ApiError,
   type Question,
   type AnswerResult,
   type SessionReport,
@@ -24,6 +26,8 @@ const fmtScore = (n: number | null | undefined) =>
 export default function App() {
   const [appState, setAppState] = useState<AppState>('LOGIN');
   const [token, setToken] = useState('');
+  const [devCode, setDevCode] = useState('');
+  const [devSubmitting, setDevSubmitting] = useState(false);
 
   // ── session / interview state (now driven by the real backend) ──
   const [sessionToken, setSessionToken] = useState('');
@@ -114,6 +118,25 @@ export default function App() {
     storeToken(t);
     setError('');
     setAppState('INTRO');
+  }
+
+  // ── DEV-ONLY: trade a fixed code for a server-minted token ──
+  async function handleDevLogin(e: React.FormEvent) {
+    e.preventDefault();
+    const code = devCode.trim();
+    if (!code || devSubmitting) return;
+    setDevSubmitting(true);
+    setError('');
+    try {
+      const { access_token } = await devLogin(code);
+      storeToken(access_token);
+      setToken(access_token);
+      setAppState('INTRO');
+    } catch (err: any) {
+      setError(err instanceof ApiError ? err.message : 'Dev login failed.');
+    } finally {
+      setDevSubmitting(false);
+    }
   }
 
   // ── start (with cold-start warm-up), real questions from the API ──
@@ -347,6 +370,35 @@ export default function App() {
                       <span>{error}</span>
                     </div>
                   )}
+
+                  {/* DEV-ONLY: fixed-code sign-in. Only works when the server has
+                      DEV_LOGIN_ENABLED set; otherwise the route 404s. */}
+                  <form onSubmit={handleDevLogin} className="space-y-4 mb-6">
+                    <div className="relative group">
+                      <div className="absolute inset-0 bg-cyan-500/20 blur-md rounded-lg opacity-0 group-focus-within:opacity-100 transition-opacity" />
+                      <input
+                        type="number"
+                        inputMode="numeric"
+                        value={devCode}
+                        onChange={(e) => setDevCode(e.target.value)}
+                        placeholder="DEV CODE (6 DIGITS)"
+                        className="relative w-full bg-[#030712] border border-cyan-500/30 rounded-lg px-4 py-4 text-cyan-50 font-mono placeholder:text-cyan-700 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400 transition-all tracking-[0.3em] text-center [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={!devCode.trim() || devSubmitting}
+                      className="w-full bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/50 hover:border-cyan-400 text-cyan-300 hover:text-cyan-100 font-mono font-bold py-3 rounded-lg transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {devSubmitting ? 'SIGNING IN…' : 'SIGN IN'}
+                    </button>
+                  </form>
+
+                  <div className="flex items-center gap-3 mb-6">
+                    <div className="h-px flex-1 bg-cyan-500/20" />
+                    <span className="text-[10px] font-mono text-cyan-500/40 uppercase tracking-widest">or paste token</span>
+                    <div className="h-px flex-1 bg-cyan-500/20" />
+                  </div>
 
                   <form onSubmit={handleLogin} className="space-y-6">
                     <div className="relative group">
