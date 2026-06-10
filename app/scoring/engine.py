@@ -11,9 +11,9 @@ WHY this module exists:
     raw details to feedback.py for the explanation.
 
 The blend — and why the "general rule" matters:
-    Base weights per question type:
-        technical            → technical 0.50, communication 0.25, confidence 0.25
-        behavioral/situational → relevance 0.35, communication 0.40, confidence 0.25
+    Base weights per question type (CONTENT-HEAVY so correctness dominates):
+        technical            → technical 0.70, communication 0.15, confidence 0.15
+        behavioral/situational → relevance 0.50, communication 0.30, confidence 0.20
 
     Confidence is the one dimension that can be None (text-only answer, no
     camera/mic). We never treat "not measured" as zero. Instead the final score
@@ -24,6 +24,10 @@ The blend — and why the "general rule" matters:
     When confidence is None its weight drops out and is re-normalized
     proportionally across the dimensions we DO have. "weights_used" in the
     result reports the actual post-redistribution weights for transparency.
+
+    CONTENT GATE: after blending (and re-normalization), the final score is
+    capped at content_score + DELIVERY_CAP, so good delivery can never rescue a
+    wrong answer. See the DELIVERY_CAP comment below.
 """
 
 from app.scoring.technical import score_technical
@@ -43,16 +47,30 @@ BAND_WEAK      = 30
 
 # ─────────────────────────────────────────────────────────
 # Base dimension weights (must sum to 1.0 within each mode).
+# CONTENT-HEAVY by design: correctness/relevance should dominate the score, so
+# slick delivery can't carry a wrong answer (see also the CONTENT GATE below).
 # ─────────────────────────────────────────────────────────
-# Technical mode: a known-answer question.
-TECH_W_TECHNICAL     = 0.50
-TECH_W_COMMUNICATION = 0.25
-TECH_W_CONFIDENCE    = 0.25
+# Technical mode: a known-answer question. Content is 70% of the blend.
+TECH_W_TECHNICAL     = 0.70
+TECH_W_COMMUNICATION = 0.15
+TECH_W_CONFIDENCE    = 0.15
 
-# Relevance mode: behavioral / situational (no known answer).
-REL_W_RELEVANCE      = 0.35
-REL_W_COMMUNICATION  = 0.40
-REL_W_CONFIDENCE     = 0.25
+# Relevance mode: behavioral / situational (no known answer). No single correct
+# answer exists, so relevance leads but delivery still matters more than in tech.
+REL_W_RELEVANCE      = 0.50
+REL_W_COMMUNICATION  = 0.30
+REL_W_CONFIDENCE     = 0.20
+
+# ─────────────────────────────────────────────────────────
+# CONTENT GATE — a hard ceiling that ties the final score to correctness.
+# After blending (and any confidence=None re-normalization), the final score is
+# capped at the CONTENT dimension score + DELIVERY_CAP. So delivery can lift a
+# good answer by at most DELIVERY_CAP points, but can NEVER rescue a poor-content
+# one: content 25 → capped at 40 (WEAK); content 80 → capped at 95 (room to shine).
+# This is an intentional, tunable knob — raise DELIVERY_CAP to let delivery count
+# for more, lower it to make correctness even more decisive.
+# ─────────────────────────────────────────────────────────
+DELIVERY_CAP = 15  # max points delivery may add on top of the content score
 
 # Question types that have NO expected answer → relevance mode.
 RELEVANCE_TYPES = ("behavioral", "situational")
@@ -188,7 +206,18 @@ def score_response(
     }
 
     # ─────────────────────────────────────────────
-    # 6. BAND the FINAL blended score.
+    # 5b. CONTENT GATE — apply AFTER re-normalization, BEFORE banding.
+    #     Cap the blended score at the content dimension + DELIVERY_CAP, so a
+    #     fluent/confident but WRONG answer can't be lifted out of its content
+    #     band by delivery. The content dimension (technical or relevance) is
+    #     always present, so content_pct is never None here.
+    # ─────────────────────────────────────────────
+    content_name = "technical" if mode == "technical" else "relevance"
+    content_pct = dimension_percentages[content_name]
+    final_percentage = round(min(final_percentage, content_pct + DELIVERY_CAP), 1)
+
+    # ─────────────────────────────────────────────
+    # 6. BAND the FINAL (gated) blended score.
     # ─────────────────────────────────────────────
     band = _get_band(final_percentage)
 

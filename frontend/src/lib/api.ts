@@ -84,13 +84,36 @@ interface CallOpts {
   token?: string;
   body?: unknown;
   timeoutMs?: number;
+  // Backoff schedule for TRANSIENT (network/timeout) failures only. One retry
+  // per entry, waiting that many ms before each. Default [] = no retries.
+  retryDelaysMs?: number[];
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * A failure is TRANSIENT (worth retrying) only when it never reached a real
+ * response — i.e. our network/timeout path. A genuine API error (4xx/5xx with
+ * the backend envelope, e.g. validation, auth, no_questions) is NOT transient
+ * and must surface immediately rather than being retried.
+ */
+function isTransientError(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    (err.code === "network_error" || err.code === "timeout")
+  );
 }
 
 /**
- * Core fetch helper. Adds JSON + optional Bearer headers, parses the body, and
- * converts any non-2xx into an ApiError using the backend's envelope.
+ * One fetch attempt. Adds JSON + optional Bearer headers, parses the body, and
+ * converts any non-2xx into an ApiError using the backend's envelope. A
+ * network-level failure (offline/DNS/CORS/abort-timeout) throws an ApiError
+ * whose code is "network_error"/"timeout" — the marker isTransientError uses.
  */
-async function call(path: string, { method = "GET", token, body, timeoutMs = 65000 }: CallOpts = {}) {
+async function attemptCall(
+  path: string,
+  { method = "GET", token, body, timeoutMs = 65000 }: CallOpts,
+) {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (token) headers["Authorization"] = `Bearer ${token}`;
@@ -136,6 +159,32 @@ async function call(path: string, { method = "GET", token, body, timeoutMs = 650
 
   return data;
 }
+
+/**
+ * Core fetch helper with TRANSIENT-only auto-retry. Real API errors are thrown
+ * on the first attempt; only network/timeout blips are retried per
+ * `retryDelaysMs` (silent backoff) before the failure is surfaced.
+ */
+async function call(path: string, opts: CallOpts = {}) {
+  const { retryDelaysMs = [] } = opts;
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+    try {
+      return await attemptCall(path, opts);
+    } catch (err) {
+      lastErr = err;
+      // Stop immediately on a real API error, or once retries are exhausted.
+      if (!isTransientError(err) || attempt === retryDelaysMs.length) throw err;
+      await sleep(retryDelaysMs[attempt]);
+    }
+  }
+  throw lastErr; // unreachable (loop either returns or throws) — satisfies TS
+}
+
+// Transient-failure backoff for the user-blocking calls (~1.5s, then ~3s).
+const TRANSIENT_RETRY_DELAYS_MS = [1500, 3000];
+// Scoring/submit is the slowest call right after a cold start — give it longer.
+const SUBMIT_TIMEOUT_MS = 90000;
 
 // ── Endpoint wrappers ──────────────────────────────────────────────────────
 
@@ -195,12 +244,25 @@ export function startSession(
       experience: experience ?? null,
       question_count: question_count ?? null,
     },
+    // A transient blip on start shouldn't dump the candidate back to an error.
+    retryDelaysMs: TRANSIENT_RETRY_DELAYS_MS,
   });
 }
 
-/** Score one answer → AnswerResult. */
+/**
+ * Score one answer → AnswerResult. Auto-retries network/timeout blips (silent
+ * backoff) so a momentary connection drop doesn't surface as a scoring error;
+ * real API errors (auth, validation) are NOT retried. Uses a longer timeout —
+ * the first submit after a cold start is slow.
+ */
 export function submitAnswer(token: string, payload: AnswerPayload): Promise<AnswerResult> {
-  return call("/api/answer/submit", { method: "POST", token, body: payload });
+  return call("/api/answer/submit", {
+    method: "POST",
+    token,
+    body: payload,
+    timeoutMs: SUBMIT_TIMEOUT_MS,
+    retryDelaysMs: TRANSIENT_RETRY_DELAYS_MS,
+  });
 }
 
 /** Finalize → aggregated report. results is an array of AnswerResult. */
