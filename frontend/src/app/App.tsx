@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Mic, Plane, ArrowRight, CheckCircle, RefreshCcw, AlertCircle, Scan, Activity, Camera, Eye, Brain, Cpu, Radar, Zap } from 'lucide-react';
+import { Mic, Plane, ArrowRight, CheckCircle, RefreshCcw, AlertCircle, Scan, Activity, Camera, Eye, Brain, Cpu, Radar, Zap, ChevronDown, ChevronRight } from 'lucide-react';
 
 import {
   API_BASE_URL,
@@ -14,20 +14,47 @@ import {
   type Question,
   type AnswerResult,
   type SessionReport,
+  type SessionConfig,
 } from '../lib/api';
 import { getToken as readStoredToken, setToken as storeToken, looksLikeJwt } from '../lib/token';
+import { speak, stopSpeaking } from '../lib/speech';
+import { useSpeechRecognition } from '../lib/useSpeechRecognition';
+import { useFaceTracking } from '../lib/useFaceTracking';
+import { useVoiceAnalysis } from '../lib/useVoiceAnalysis';
+import DeviceCheck from './components/DeviceCheck';
+import SetupScreen from './components/SetupScreen';
+import { Button } from './components/ui/button';
+import { Alert, AlertDescription } from './components/ui/alert';
 
-type AppState = 'LOGIN' | 'INTRO' | 'INTERVIEW' | 'SCORECARD';
+type AppState =
+  | 'AUTH_LOADING'
+  | 'LOGIN'
+  | 'SETUP'
+  | 'CONSENT'
+  | 'DEVICE_CHECK'
+  | 'INTRO'
+  | 'INTERVIEW'
+  | 'SCORECARD';
+
+// ── Phase A2 auth gating ──
+// The user-facing login is disabled: on load the app SILENTLY trades a fixed dev
+// code for a real server-minted token. The legacy LOGIN screen is kept in the
+// code but gated behind VITE_ENABLE_LOGIN for later re-enable.
+const LOGIN_ENABLED = (import.meta.env.VITE_ENABLE_LOGIN as string) === 'true';
+const DEV_LOGIN_CODE = (import.meta.env.VITE_DEV_LOGIN_CODE as string) || '';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const fmtScore = (n: number | null | undefined) =>
   n == null || Number.isNaN(n) ? '—' : Number.isInteger(n) ? String(n) : n.toFixed(1);
 
 export default function App() {
-  const [appState, setAppState] = useState<AppState>('LOGIN');
+  const [appState, setAppState] = useState<AppState>('AUTH_LOADING');
   const [token, setToken] = useState('');
   const [devCode, setDevCode] = useState('');
   const [devSubmitting, setDevSubmitting] = useState(false);
+
+  // Interview parameters chosen on the SETUP screen, passed to startSession().
+  const [sessionConfig, setSessionConfig] = useState<SessionConfig>({});
 
   // ── session / interview state (now driven by the real backend) ──
   const [sessionToken, setSessionToken] = useState('');
@@ -37,6 +64,11 @@ export default function App() {
   const [timeLeft, setTimeLeft] = useState(120);
   const [results, setResults] = useState<AnswerResult[]>([]);
   const [report, setReport] = useState<SessionReport | null>(null);
+  // Candidate's own answer text, kept per question_id so the scorecard can show
+  // it beside the model answer (the backend never echoes the submitted text).
+  const [answersByQuestion, setAnswersByQuestion] = useState<Record<string, string>>({});
+  // Which scorecard question row is expanded (collapsible review).
+  const [expandedQ, setExpandedQ] = useState<string | null>(null);
 
   const [isRecording, setIsRecording] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -45,28 +77,125 @@ export default function App() {
   const [error, setError] = useState('');
 
   const inFlightRef = useRef(false);
-  const videoRef = useRef<HTMLVideoElement>(null);
   const [cameraActive, setCameraActive] = useState(false);
 
   const currentQuestion = questions[currentQuestionIndex];
 
-  // Restore a token pasted earlier in this tab.
-  useEffect(() => {
-    const t = readStoredToken();
-    if (t) {
-      setToken(t);
-      setAppState('INTRO');
+  // ── speech-to-text: append finalized speech into the existing answer box ──
+  const {
+    supported: sttSupported,
+    listening,
+    interim,
+    error: sttError,
+    start: startListening,
+    stop: stopListening,
+  } = useSpeechRecognition({
+    onFinalResult: (chunk) =>
+      setCurrentAnswer((prev) => (prev ? prev.trimEnd() + ' ' : '') + chunk.trim()),
+  });
+
+  // ── face tracking → per-question behavioral_features + live UI levels (best-effort) ──
+  // App owns the single <video> ref + the hook; the same element is shown in the AI panel.
+  const faceVideoRef = useRef<HTMLVideoElement>(null);
+  const {
+    faceDetected,
+    liveEyeContact,
+    liveFacialConfidence,
+    getQuestionMetrics,
+    resetQuestionMetrics,
+  } = useFaceTracking(faceVideoRef, appState === 'INTERVIEW');
+
+  // ── voice prosody → merged into the same behavioral_features blob (best-effort) ──
+  const { getQuestionVoiceMetrics, resetQuestionVoiceMetrics } = useVoiceAnalysis(
+    appState === 'INTERVIEW',
+  );
+
+  // ── Auto-listen plumbing (PART 3) ──
+  // Live mirrors of fast-changing values so the TTS 'end' callback (which fires
+  // outside React's render flow, sometimes late) always reads CURRENT values
+  // instead of a stale closure.
+  const appStateRef = useRef(appState);
+  appStateRef.current = appState;
+  const sttSupportedRef = useRef(sttSupported);
+  sttSupportedRef.current = sttSupported;
+  const submittingRef = useRef(submitting);
+  submittingRef.current = submitting;
+  const listeningRef = useRef(listening);
+  listeningRef.current = listening;
+  const startListeningRef = useRef(startListening);
+  startListeningRef.current = startListening;
+  const activeQuestionIdRef = useRef<string | undefined>(currentQuestion?.id);
+  activeQuestionIdRef.current = currentQuestion?.id;
+
+  // After a question is read aloud, auto-start the mic — but ONLY if we're still
+  // on the same question, STT is supported, and we're not mid-submit/already
+  // listening. Any of those failing safely falls back to manual typing/mic.
+  function maybeAutoListen(questionId: string) {
+    if (!sttSupportedRef.current) return;                 // non-Chrome: typing only
+    if (appStateRef.current !== 'INTERVIEW') return;      // left the interview
+    if (activeQuestionIdRef.current !== questionId) return; // question changed / cancelled
+    if (submittingRef.current) return;                    // scoring in flight
+    if (listeningRef.current) return;                     // already listening
+    startListeningRef.current();
+  }
+
+  // Read a question aloud, then hand off to auto-listen when the TTS ends. Used
+  // by both the per-question effect and the manual Replay button, so a skipped/
+  // blocked auto-play can still be recovered via Replay.
+  function playQuestion(q: { id: string; question: string }) {
+    speak(q.question, () => maybeAutoListen(q.id));
+  }
+
+  // ── Silent sign-in on load (user-facing login disabled) ──
+  // Reuse a token from this tab if present; otherwise trade the fixed dev code
+  // for a real token, then open the SETUP screen. On failure show a friendly
+  // inline error (and fall back to the gated LOGIN screen only if re-enabled).
+  async function bootAuth() {
+    setError('');
+    const existing = readStoredToken();
+    if (existing) {
+      setToken(existing);
+      setAppState('SETUP');
+      return;
     }
+    if (LOGIN_ENABLED) {
+      setAppState('LOGIN');
+      return;
+    }
+    if (!DEV_LOGIN_CODE) {
+      setAppState('AUTH_LOADING');
+      setError('Sign-in is not configured (VITE_DEV_LOGIN_CODE is missing).');
+      return;
+    }
+    setAppState('AUTH_LOADING');
+    try {
+      const { access_token } = await devLogin(DEV_LOGIN_CODE);
+      storeToken(access_token);
+      setToken(access_token);
+      setAppState('SETUP');
+    } catch (err: any) {
+      setError(
+        err instanceof ApiError
+          ? err.message
+          : 'Could not establish a secure session. Please retry.',
+      );
+      setAppState('AUTH_LOADING');
+    }
+  }
+
+  useEffect(() => {
+    bootAuth();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── cosmetic camera feed (behavioral capture lands in a later phase) ──
+  // ── single webcam stream: feeds the on-screen preview AND MediaPipe face tracking ──
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        setCameraActive(true);
+      if (faceVideoRef.current) {
+        faceVideoRef.current.srcObject = stream;
       }
+      setCameraActive(true);
     } catch (err) {
       console.error('Failed to access camera', err);
       setCameraActive(false);
@@ -74,11 +203,12 @@ export default function App() {
   };
 
   const stopCamera = () => {
-    if (videoRef.current && videoRef.current.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
+    if (faceVideoRef.current && faceVideoRef.current.srcObject) {
+      const stream = faceVideoRef.current.srcObject as MediaStream;
       stream.getTracks().forEach((track) => track.stop());
-      setCameraActive(false);
+      faceVideoRef.current.srcObject = null;
     }
+    setCameraActive(false);
   };
 
   useEffect(() => {
@@ -98,6 +228,8 @@ export default function App() {
     setResults([]);
     setReport(null);
     setCurrentAnswer('');
+    setAnswersByQuestion({});
+    setExpandedQ(null);
     setError('');
   }
 
@@ -107,8 +239,14 @@ export default function App() {
     resetSession();
     setSubmitting(false);
     inFlightRef.current = false;
-    setError('Your token was rejected (expired or invalid). Paste a fresh one.');
-    setAppState('LOGIN');
+    if (LOGIN_ENABLED) {
+      setError('Your token was rejected (expired or invalid). Paste a fresh one.');
+      setAppState('LOGIN');
+    } else {
+      // Login UI is disabled — silently re-establish a token and return to setup.
+      setError('Session expired — re-establishing a secure link…');
+      bootAuth();
+    }
   }
 
   function handleLogin(e: React.FormEvent) {
@@ -117,7 +255,7 @@ export default function App() {
     if (!t) return;
     storeToken(t);
     setError('');
-    setAppState('INTRO');
+    setAppState('DEVICE_CHECK');
   }
 
   // ── DEV-ONLY: trade a fixed code for a server-minted token ──
@@ -131,7 +269,7 @@ export default function App() {
       const { access_token } = await devLogin(code);
       storeToken(access_token);
       setToken(access_token);
-      setAppState('INTRO');
+      setAppState('DEVICE_CHECK');
     } catch (err: any) {
       setError(err instanceof ApiError ? err.message : 'Dev login failed.');
     } finally {
@@ -164,7 +302,7 @@ export default function App() {
     try {
       await warmUp(); // best-effort; we still try to start even if it times out
       setWarming('');
-      const data = await startSession(token);
+      const data = await startSession(token, sessionConfig);
       const qs = data.questions || [];
       if (qs.length === 0) {
         setError('No questions were returned for this session.');
@@ -193,20 +331,36 @@ export default function App() {
     if (inFlightRef.current || submitting || !currentQuestion) return;
     if (!wasSkipped && !currentAnswer.trim()) return;
 
+    stopListening(); // end voice capture before scoring this answer
+
     inFlightRef.current = true;
     setSubmitting(true);
     setError('');
 
     const q = currentQuestion;
     const limit = q.time_limit_seconds || 90;
+
+    // Remember what the candidate actually answered, for the scorecard review.
+    const candidateText = wasSkipped ? '' : currentAnswer.trim();
+    setAnswersByQuestion((prev) => ({ ...prev, [q.id]: candidateText }));
+
+    // Snapshot this question's camera + voice metrics; null when neither produced data.
+    const cam = getQuestionMetrics();
+    const words = currentAnswer.trim() ? currentAnswer.trim().split(/\s+/).length : 0;
+    const voice = getQuestionVoiceMetrics(words);
+    const merged = { ...cam, ...voice };
+    const behavioral_features = Object.keys(merged).length ? merged : null;
+    resetQuestionMetrics();
+    resetQuestionVoiceMetrics();
+
     try {
       const result = await submitAnswer(token, {
         session_token: sessionToken,
         question_id: q.id,
-        student_answer_text: wasSkipped ? '' : currentAnswer.trim(),
+        student_answer_text: candidateText,
         time_taken_seconds: Math.max(0, limit - timeLeft),
         was_skipped: wasSkipped,
-        behavioral_features: null, // text-only for now; voice/camera tone comes later
+        behavioral_features,
       });
 
       const nextResults = [...results, result];
@@ -251,7 +405,7 @@ export default function App() {
 
   function handleRestart() {
     resetSession();
-    setAppState('INTRO');
+    setAppState('SETUP');
   }
 
   // ── countdown (frozen while a score is in flight) ──
@@ -271,6 +425,27 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [timeLeft, appState]);
 
+  // ── read each new question aloud (TTS); auto-listen on end; cancel on change ──
+  useEffect(() => {
+    if (appState !== 'INTERVIEW' || !currentQuestion) return;
+    playQuestion(currentQuestion);
+    return () => stopSpeaking();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appState, currentQuestion?.id]);
+
+  // ── stop voice capture (and clear the interim preview) on question change/unmount ──
+  useEffect(() => {
+    return () => stopListening();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentQuestionIndex]);
+
+  // ── reset behavioral accumulators (camera + voice) when a new question becomes current ──
+  useEffect(() => {
+    resetQuestionMetrics();
+    resetQuestionVoiceMetrics();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentQuestionIndex]);
+
   const formatTime = (seconds: number) => {
     const m = Math.floor(seconds / 60);
     const s = seconds % 60;
@@ -281,6 +456,14 @@ export default function App() {
   const totalScore = report?.total_score ?? 0;
   const passed = totalScore > 60;
   const perQuestion = report?.per_question ?? [];
+
+  // Scorecard joins (by question_id): question text, the answer the candidate
+  // gave, the per-answer feedback, and the post-interview model answer.
+  const questionTextById: Record<string, string> = {};
+  for (const q of questions) questionTextById[q.id] = q.question;
+  const resultById: Record<string, AnswerResult> = {};
+  for (const r of results) resultById[r.question_id] = r;
+  const modelAnswers = report?.model_answers ?? {};
 
   // Futuristic Background Grid
   const GridBackground = () => (
@@ -325,7 +508,7 @@ export default function App() {
               <Cpu className="w-4 h-4" />
               <span>SYS_ONLINE</span>
             </div>
-            {appState !== 'LOGIN' && (
+            {token && appState !== 'LOGIN' && (
               <div className="px-3 py-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 text-xs font-mono flex items-center gap-2 shadow-[0_0_10px_rgba(16,185,129,0.2)]">
                 <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
                 SECURE_LINK
@@ -338,7 +521,100 @@ export default function App() {
       <main className="max-w-7xl mx-auto px-6 py-8 sm:py-12">
         <AnimatePresence mode="wait">
 
-          {appState === 'LOGIN' && (
+          {appState === 'AUTH_LOADING' && (
+            <motion.div
+              key="auth-loading"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="max-w-md mx-auto mt-28 text-center"
+            >
+              {error ? (
+                <div className="space-y-6">
+                  <div className="flex items-start gap-2 px-4 py-3 rounded-lg border border-red-500/40 bg-red-500/10 text-red-300 text-sm font-mono text-left">
+                    <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                    <span>{error}</span>
+                  </div>
+                  <button
+                    onClick={bootAuth}
+                    className="px-8 py-3 bg-cyan-500/10 border border-cyan-400 text-cyan-300 hover:bg-cyan-500 hover:text-[#030712] font-mono font-bold text-sm uppercase tracking-widest transition-all rounded-sm"
+                  >
+                    Retry Sign-In
+                  </button>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center gap-4 text-cyan-300 font-mono">
+                  <span className="w-8 h-8 rounded-full border-2 border-cyan-500/40 border-t-cyan-300 animate-spin" />
+                  <span className="text-sm uppercase tracking-widest">
+                    Establishing secure link…
+                  </span>
+                </div>
+              )}
+            </motion.div>
+          )}
+
+          {appState === 'SETUP' && (
+            <SetupScreen
+              onCommence={(cfg) => {
+                setSessionConfig(cfg);
+                setError('');
+                setAppState('CONSENT');
+              }}
+            />
+          )}
+
+          {appState === 'CONSENT' && (
+            <motion.div
+              key="consent"
+              initial={{ opacity: 0, y: 40 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -40 }}
+              className="max-w-2xl mx-auto mt-16"
+            >
+              <div className="relative bg-[#080d1a]/80 backdrop-blur-xl border border-cyan-500/30 rounded-xl p-1 shadow-[0_0_50px_rgba(6,182,212,0.1)]">
+                <div className="absolute top-0 left-0 w-4 h-4 border-t-2 border-l-2 border-cyan-400" />
+                <div className="absolute top-0 right-0 w-4 h-4 border-t-2 border-r-2 border-cyan-400" />
+                <div className="absolute bottom-0 left-0 w-4 h-4 border-b-2 border-l-2 border-cyan-400" />
+                <div className="absolute bottom-0 right-0 w-4 h-4 border-b-2 border-r-2 border-cyan-400" />
+
+                <div className="p-8 sm:p-10 relative z-10">
+                  <div className="flex items-center justify-center gap-3 mb-6">
+                    <Camera className="w-7 h-7 text-cyan-400" />
+                    <Mic className="w-7 h-7 text-cyan-400" />
+                  </div>
+                  <h2 className="text-xl sm:text-2xl font-bold text-center text-white mb-6 uppercase tracking-widest font-mono">
+                    Camera &amp; microphone notice
+                  </h2>
+                  <p className="text-cyan-100/80 text-center leading-relaxed font-mono text-sm mb-10">
+                    This mock interview uses your camera and microphone to analyse
+                    your delivery (eye contact, expression, voice). No video or
+                    audio is recorded, stored, or sent — only the derived scores.
+                    You can answer by typing instead.
+                  </p>
+
+                  <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
+                    <button
+                      onClick={() => {
+                        setError('');
+                        setAppState('DEVICE_CHECK');
+                      }}
+                      className="px-8 py-3.5 bg-cyan-500 text-[#030712] font-mono font-bold text-sm uppercase tracking-widest rounded-sm hover:shadow-[0_0_30px_rgba(6,182,212,0.5)] transition-all flex items-center gap-2"
+                    >
+                      <CheckCircle className="w-4 h-4" /> I understand — continue
+                    </button>
+                    <button
+                      onClick={() => setAppState('SETUP')}
+                      className="text-cyan-500/60 hover:text-cyan-400 font-mono text-sm px-6 py-3.5 transition-colors uppercase tracking-widest"
+                    >
+                      [ Back to setup ]
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          )}
+
+          {LOGIN_ENABLED && appState === 'LOGIN' && (
             <motion.div
               key="login"
               initial={{ opacity: 0, scale: 0.9, filter: 'blur(10px)' }}
@@ -437,6 +713,17 @@ export default function App() {
             </motion.div>
           )}
 
+          {appState === 'DEVICE_CHECK' && (
+            <motion.div
+              key="devicecheck"
+              initial={{ opacity: 0, y: 40 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -40 }}
+            >
+              <DeviceCheck onReady={() => setAppState('INTRO')} />
+            </motion.div>
+          )}
+
           {appState === 'INTRO' && (
             <motion.div
               key="intro"
@@ -494,15 +781,20 @@ export default function App() {
 
                     <button
                       onClick={() => {
-                        storeToken('');
-                        setToken('');
                         resetSession();
-                        setAppState('LOGIN');
+                        if (LOGIN_ENABLED) {
+                          storeToken('');
+                          setToken('');
+                          setAppState('LOGIN');
+                        } else {
+                          // Login UI disabled — keep the token, return to setup.
+                          setAppState('SETUP');
+                        }
                       }}
                       disabled={starting}
                       className="text-cyan-500/60 hover:text-cyan-400 font-mono text-sm px-6 py-4 transition-colors uppercase tracking-widest disabled:opacity-50"
                     >
-                      [ Abort / Re-Auth ]
+                      {LOGIN_ENABLED ? '[ Abort / Re-Auth ]' : '[ Back to Setup ]'}
                     </button>
                   </div>
                 </div>
@@ -555,18 +847,47 @@ export default function App() {
                     {currentQuestion.question}
                   </motion.h2>
 
+                  <div className="-mt-6 mb-8">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => playQuestion(currentQuestion)}
+                    >
+                      🔊 Replay
+                    </Button>
+                  </div>
+
                   <div className="space-y-4 flex-1">
                     <div className="flex justify-between items-center mb-2">
                       <label className="text-xs font-mono text-cyan-400/80 uppercase tracking-widest">
                         Response Input
                       </label>
-                      <button
-                        onClick={() => setIsRecording(!isRecording)}
-                        className={`flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded transition-all ${isRecording ? 'bg-red-500/20 text-red-400 border border-red-500/50 shadow-[0_0_15px_rgba(239,68,68,0.3)] animate-pulse' : 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20'}`}
-                      >
-                        <Mic className="w-3.5 h-3.5" />
-                        {isRecording ? 'RECORDING...' : 'DICTATE'}
-                      </button>
+                      {/* Speech-to-text: append spoken answer into the box (Chrome/Edge only) */}
+                      {sttSupported ? (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => (listening ? stopListening() : startListening())}
+                          disabled={submitting}
+                          className={listening ? 'border-red-500/50 text-red-400 animate-pulse' : ''}
+                        >
+                          <Mic className="w-3.5 h-3.5" />
+                          {listening ? '⏹ Stop' : '🎤 Speak'}
+                        </Button>
+                      ) : (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled
+                          title="Voice input needs Google Chrome"
+                        >
+                          <Mic className="w-3.5 h-3.5" />
+                          Voice input needs Google Chrome
+                        </Button>
+                      )}
                     </div>
 
                     <div className="relative group h-[250px]">
@@ -581,6 +902,20 @@ export default function App() {
                         className="w-full h-full bg-[#030712]/80 border border-cyan-500/20 p-5 text-cyan-50 font-mono placeholder:text-cyan-800/50 focus:outline-none focus:border-cyan-400 focus:bg-[#030712] transition-all resize-none shadow-inner custom-scrollbar disabled:opacity-60"
                       />
                     </div>
+
+                    {/* Live (non-final) speech preview while listening */}
+                    {listening && interim && (
+                      <p className="text-xs font-mono text-cyan-500/50 italic truncate">
+                        {interim}
+                      </p>
+                    )}
+
+                    {/* Friendly voice-input error (typing still works) */}
+                    {sttError && (
+                      <Alert variant="destructive">
+                        <AlertDescription>{sttError}</AlertDescription>
+                      </Alert>
+                    )}
                   </div>
 
                   {error && (
@@ -660,16 +995,15 @@ export default function App() {
                   </div>
 
                   <div className="aspect-video bg-[#030712] relative flex items-center justify-center overflow-hidden">
-                    {cameraActive ? (
-                      <video
-                        ref={videoRef}
-                        autoPlay
-                        playsInline
-                        muted
-                        className="w-full h-full object-cover grayscale opacity-90"
-                        style={{ filter: 'contrast(1.1) brightness(1.2) hue-rotate(180deg)' }}
-                      />
-                    ) : (
+                    {/* Single real webcam feed — also the source MediaPipe analyses. Kept mounted so the ref is stable. */}
+                    <video
+                      ref={faceVideoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className={`w-full h-full object-cover opacity-90 ${cameraActive ? '' : 'hidden'}`}
+                    />
+                    {!cameraActive && (
                       <div className="flex flex-col items-center text-cyan-500/40">
                         <Camera className="w-8 h-8 mb-2" />
                         <span className="text-xs font-mono">VISION UNAVAILABLE</span>
@@ -701,28 +1035,47 @@ export default function App() {
 
                     <div className="flex justify-between items-center text-sm font-mono pt-2">
                       <span className="text-cyan-400/70">EYE TRACKING</span>
-                      <span className="text-cyan-300">FOCUSED</span>
+                      <span className="text-cyan-300">
+                        {!faceDetected
+                          ? '—'
+                          : liveEyeContact > 0.6
+                            ? 'FOCUSED'
+                            : liveEyeContact > 0.3
+                              ? 'WANDERING'
+                              : 'AWAY'}
+                      </span>
                     </div>
                     <div className="h-1.5 w-full bg-cyan-950 rounded-full overflow-hidden">
                       <motion.div
-                        className="h-full bg-cyan-500"
-                        initial={{ width: '90%' }}
-                        animate={{ width: ['90%', '98%', '85%', '95%'] }}
-                        transition={{ repeat: Infinity, duration: 3.5, ease: 'easeInOut' }}
+                        className="h-full bg-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.6)]"
+                        animate={{ width: `${faceDetected ? Math.round(liveEyeContact * 100) : 0}%` }}
+                        transition={{ duration: 0.2, ease: 'easeOut' }}
                       />
                     </div>
 
                     <div className="flex justify-between items-center text-sm font-mono pt-2">
                       <span className="text-cyan-400/70">MICRO-EXPRESSIONS</span>
-                      <span className="text-cyan-300">CALM</span>
+                      <span className="text-cyan-300">
+                        {!faceDetected
+                          ? '—'
+                          : liveFacialConfidence > 0.6
+                            ? 'CALM'
+                            : liveFacialConfidence > 0.4
+                              ? 'NEUTRAL'
+                              : 'TENSE'}
+                      </span>
                     </div>
                     <div className="h-1.5 w-full bg-cyan-950 rounded-full overflow-hidden">
-                      <div className="h-full bg-cyan-600 w-[95%]" />
+                      <motion.div
+                        className="h-full bg-cyan-500 shadow-[0_0_10px_rgba(34,211,238,0.5)]"
+                        animate={{ width: `${faceDetected ? Math.round(liveFacialConfidence * 100) : 0}%` }}
+                        transition={{ duration: 0.2, ease: 'easeOut' }}
+                      />
                     </div>
                   </div>
 
                   <div className="mt-8 p-3 border border-cyan-500/20 bg-cyan-500/5 rounded text-xs font-mono text-cyan-500/60 leading-relaxed">
-                    <span className="text-cyan-400 animate-pulse font-bold">&gt;_</span> Responses are scored live by the AviAssess engine. Camera telemetry is illustrative; behavioral scoring is not yet wired in.
+                    <span className="text-cyan-400 animate-pulse font-bold">&gt;_</span> Responses are scored live by the AviAssess engine. Camera telemetry above is live face tracking feeding your behavioral score.
                   </div>
                 </div>
               </div>
@@ -783,30 +1136,106 @@ export default function App() {
                 <div className="space-y-2">
                   {perQuestion.map((q, i) => {
                     const skipped = (q.band || '').toLowerCase() === 'skipped';
+                    const qid = q.question_id;
+                    const expanded = expandedQ === qid;
+                    const questionText = questionTextById[qid];
+                    const candidateAnswer = (answersByQuestion[qid] || '').trim();
+                    // Model answers are revealed post-interview; may be null for
+                    // behavioral questions. Quality depends on the Phase B dataset.
+                    const modelAnswer = (modelAnswers[qid] || '')?.trim?.() || '';
+                    const fb = resultById[qid]?.feedback;
+
                     return (
                       <motion.div
                         initial={{ opacity: 0, x: -20 }}
                         animate={{ opacity: 1, x: 0 }}
-                        transition={{ delay: i * 0.1 }}
-                        key={q.question_id || i}
-                        className="flex flex-col sm:flex-row sm:items-center justify-between p-4 bg-cyan-950/20 border border-cyan-500/10 rounded-sm hover:border-cyan-500/30 transition-colors group"
+                        transition={{ delay: i * 0.05 }}
+                        key={qid || i}
+                        className="bg-cyan-950/20 border border-cyan-500/10 rounded-sm hover:border-cyan-500/30 transition-colors overflow-hidden"
                       >
-                        <div className="flex items-center gap-4 mb-2 sm:mb-0">
-                          <div className="text-cyan-500/40 font-mono text-sm w-8">0{i + 1}</div>
-                          <div className="text-cyan-100 font-mono text-sm truncate max-w-[200px] sm:max-w-md group-hover:text-cyan-300 transition-colors">
-                            {String(q.question_id).toUpperCase()}
+                        {/* Header row — click to expand the review */}
+                        <button
+                          type="button"
+                          onClick={() => setExpandedQ(expanded ? null : qid)}
+                          className="w-full flex items-center justify-between gap-4 p-4 text-left group"
+                        >
+                          <div className="flex items-center gap-4 min-w-0">
+                            {expanded ? (
+                              <ChevronDown className="w-4 h-4 text-cyan-400 shrink-0" />
+                            ) : (
+                              <ChevronRight className="w-4 h-4 text-cyan-500/50 shrink-0" />
+                            )}
+                            <div className="text-cyan-500/40 font-mono text-sm w-6 shrink-0">0{i + 1}</div>
+                            <div className="text-cyan-100 font-mono text-sm truncate group-hover:text-cyan-300 transition-colors">
+                              {questionText || String(qid).toUpperCase()}
+                            </div>
                           </div>
-                        </div>
-                        <div className="flex items-center justify-between sm:justify-end gap-6 w-full sm:w-auto pl-12 sm:pl-0">
-                          <span
-                            className={`text-xs font-mono tracking-widest px-3 py-1 rounded-sm border uppercase ${skipped ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'}`}
+                          <div className="flex items-center gap-4 sm:gap-6 shrink-0">
+                            <span
+                              className={`text-xs font-mono tracking-widest px-3 py-1 rounded-sm border uppercase ${skipped ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'}`}
+                            >
+                              {q.band || (skipped ? 'skipped' : 'scored')}
+                            </span>
+                            <div className="text-white font-mono w-12 text-right text-lg">
+                              {fmtScore(q.final_score)}
+                            </div>
+                          </div>
+                        </button>
+
+                        {/* Collapsible review body */}
+                        {expanded && (
+                          <motion.div
+                            initial={{ opacity: 0, height: 0 }}
+                            animate={{ opacity: 1, height: 'auto' }}
+                            className="border-t border-cyan-500/10 px-4 sm:px-6 py-5 space-y-5"
                           >
-                            {q.band || (skipped ? 'skipped' : 'scored')}
-                          </span>
-                          <div className="text-white font-mono w-12 text-right text-lg">
-                            {fmtScore(q.final_score)}
-                          </div>
-                        </div>
+                            {questionText && (
+                              <div>
+                                <div className="text-[10px] font-mono text-cyan-500/50 uppercase tracking-widest mb-1">Question</div>
+                                <p className="text-cyan-100/90 text-sm leading-relaxed">{questionText}</p>
+                              </div>
+                            )}
+
+                            <div>
+                              <div className="text-[10px] font-mono text-cyan-500/50 uppercase tracking-widest mb-1">Your answer</div>
+                              <p className="text-cyan-50/90 text-sm leading-relaxed whitespace-pre-wrap font-mono bg-[#030712]/60 border border-cyan-500/15 rounded-sm p-3">
+                                {candidateAnswer || <span className="text-cyan-500/40 italic">— skipped / no answer —</span>}
+                              </p>
+                            </div>
+
+                            <div>
+                              <div className="text-[10px] font-mono text-emerald-400/60 uppercase tracking-widest mb-1">Model answer</div>
+                              <p className="text-emerald-100/90 text-sm leading-relaxed whitespace-pre-wrap bg-emerald-500/5 border border-emerald-500/20 rounded-sm p-3">
+                                {modelAnswer || (
+                                  <span className="text-cyan-500/40 italic">
+                                    No model answer for this question (open-ended / behavioral).
+                                  </span>
+                                )}
+                              </p>
+                            </div>
+
+                            {fb?.overall && (
+                              <div>
+                                <div className="text-[10px] font-mono text-cyan-500/50 uppercase tracking-widest mb-1">Feedback</div>
+                                <p className="text-cyan-200/80 text-sm leading-relaxed">{fb.overall}</p>
+                                {(fb.keywords_hit?.length || fb.keywords_missed?.length) ? (
+                                  <div className="flex flex-wrap gap-2 mt-3">
+                                    {fb.keywords_hit?.map((k) => (
+                                      <span key={`hit-${k}`} className="text-[10px] font-mono px-2 py-0.5 rounded-sm border border-emerald-500/30 bg-emerald-500/10 text-emerald-300">
+                                        ✓ {k}
+                                      </span>
+                                    ))}
+                                    {fb.keywords_missed?.map((k) => (
+                                      <span key={`miss-${k}`} className="text-[10px] font-mono px-2 py-0.5 rounded-sm border border-red-500/30 bg-red-500/10 text-red-300">
+                                        ✗ {k}
+                                      </span>
+                                    ))}
+                                  </div>
+                                ) : null}
+                              </div>
+                            )}
+                          </motion.div>
+                        )}
                       </motion.div>
                     );
                   })}

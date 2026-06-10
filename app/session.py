@@ -33,6 +33,123 @@ class SessionError(Exception):
 
 
 # ─────────────────────────────────────────────────────────
+# Phase A1 taxonomy — screen-facing labels → backend selection values.
+#
+# These are the ONLY place the frontend's vocabulary is translated to the
+# question-bank's vocabulary. Keep all mapping here so the bank schema and the
+# endpoint never need to know about screen labels.
+# ─────────────────────────────────────────────────────────
+
+# interview_type (screen) → backend question_type(s) to draw from.
+INTERVIEW_TYPE_MAP: dict[str, list[str]] = {
+    "hr_personal": ["behavioral", "situational"],
+    "technical": ["technical"],
+}
+
+# Recognised interview types that are NOT wired yet. The endpoint answers these
+# with a clean "not yet available" response — never questions, never a 500.
+INTERVIEW_TYPES_NOT_AVAILABLE: frozenset[str] = frozenset(
+    {"sim_check_debrief", "group_exercise"}
+)
+
+# difficulty (screen band) → backend difficulty value used in the question bank.
+DIFFICULTY_MAP: dict[str, str] = {
+    "friendly": "basic",       # easiest band
+    "standard": "intermediate",  # middle band
+    "tough": "advanced",       # hardest band
+}
+
+# Backend difficulty values that may be passed through as-is (legacy callers
+# sent these directly, before the friendly/standard/tough labels existed).
+_BACKEND_DIFFICULTIES: frozenset[str] = frozenset({"basic", "intermediate", "advanced"})
+
+
+def resolve_interview_type(interview_type: str | None) -> tuple[str, list[str] | None]:
+    """
+    Translate a screen `interview_type` into backend question_types.
+
+    Returns a (status, types) tuple:
+        ("ok", [...])            → constrain selection to these question_types
+        ("not_available", None)  → recognised but not wired yet (endpoint → 422)
+        ("no_filter", None)      → absent OR unknown → do not constrain by type
+
+    LENIENT by design: an unrecognised value yields "no_filter" rather than an
+    error, so a stray label from an evolving frontend can never 500/422.
+    """
+    if not interview_type:
+        return ("no_filter", None)
+    key = interview_type.strip().lower()
+    if key in INTERVIEW_TYPE_MAP:
+        return ("ok", INTERVIEW_TYPE_MAP[key])
+    if key in INTERVIEW_TYPES_NOT_AVAILABLE:
+        return ("not_available", None)
+    return ("no_filter", None)
+
+
+def resolve_difficulty(difficulty: str | None) -> str | None:
+    """
+    Translate a screen difficulty band into a backend difficulty value.
+
+    friendly/standard/tough → basic/intermediate/advanced. Legacy backend values
+    (basic/intermediate/advanced) pass through unchanged for backward
+    compatibility. Anything else (or None) → None, i.e. no difficulty filter.
+    """
+    if not difficulty:
+        return None
+    key = difficulty.strip().lower()
+    if key in DIFFICULTY_MAP:
+        return DIFFICULTY_MAP[key]
+    if key in _BACKEND_DIFFICULTIES:
+        return key
+    return None  # unknown → no filter (lenient)
+
+
+def _question_matches(
+    q: dict,
+    *,
+    type_filter: set[str] | None,
+    category_filter: set[str] | None,
+    difficulty: str | None,
+    airline: str | None,
+    aircraft_type: str | None,
+    experience: str | None,
+) -> bool:
+    """
+    Decide whether a single question survives the active filters.
+
+    GRACEFUL, NON-STRICT matching:
+      * type/category are hard scope (the interview's core shape).
+      * difficulty and the airline/aircraft_type/experience TAGS are optional:
+        a question that LACKS the tag (key absent or None) matches ANY requested
+        value. This keeps the current untagged fixture fully usable — we never
+        exclude a question merely for not carrying a tag.
+    """
+    if type_filter is not None and q.get("question_type") not in type_filter:
+        return False
+    if category_filter is not None and q.get("category") not in category_filter:
+        return False
+
+    # difficulty: untagged question (None/absent) is a wildcard match.
+    if difficulty is not None:
+        qd = q.get("difficulty")
+        if qd is not None and qd != difficulty:
+            return False
+
+    # Optional tags: untagged question is a wildcard match for that dimension.
+    for value, key in (
+        (airline, "airline"),
+        (aircraft_type, "aircraft_type"),
+        (experience, "experience"),
+    ):
+        if value is not None:
+            qv = q.get(key)
+            if qv is not None and qv != value:
+                return False
+
+    return True
+
+
+# ─────────────────────────────────────────────────────────
 # 1. Stratified question selection
 # ─────────────────────────────────────────────────────────
 def select_questions(
@@ -40,6 +157,10 @@ def select_questions(
     num_questions: int,
     enabled_types: list[str] | None = None,
     enabled_categories: list[str] | None = None,
+    difficulty: str | None = None,
+    airline: str | None = None,
+    aircraft_type: str | None = None,
+    experience: str | None = None,
 ) -> list[dict]:
     """
     Pick `num_questions` from `pool`, spread as evenly as possible across the
@@ -50,6 +171,20 @@ def select_questions(
         num_questions       : How many to select.
         enabled_types       : If given, only these question_types are eligible.
         enabled_categories  : If given, only these categories are eligible.
+        difficulty          : Backend difficulty value (already mapped from any
+                              screen band). Untagged questions match any value.
+        airline             : Optional airline tag filter (graceful — see below).
+        aircraft_type       : Optional aircraft-type tag filter (graceful).
+        experience          : Optional experience tag filter (graceful).
+
+    GRACEFUL RELAXATION (never error on a thin combo, never return zero where a
+    broader pool exists): if the filtered pool is smaller than `num_questions`,
+    progressively drop the MOST SPECIFIC filters in this order until enough
+    questions exist —
+        aircraft_type → experience → airline → difficulty
+    enabled_types / enabled_categories are the interview's core scope and are
+    NEVER relaxed. If even the fully-relaxed pool is short, return as many as are
+    available.
 
     Returns:
         FULL question dicts (copies), each with an added "order" (1..N).
@@ -57,23 +192,56 @@ def select_questions(
         (dropping answer/keywords) before sending anything to the client.
 
     Raises:
-        ValueError: if the pool is empty, num_questions < 1, or nothing matches
-                    the requested filters (a zero-question session is useless).
+        ValueError: if the pool is empty, num_questions < 1, or NOTHING matches
+                    even after full relaxation (the type/category scope itself is
+                    empty — a zero-question session is useless).
     """
     if not pool:
         raise ValueError("Question pool is empty — cannot start a session.")
     if num_questions < 1:
         raise ValueError("num_questions must be at least 1.")
 
-    # ── Filter ──
     type_filter = set(enabled_types) if enabled_types else None
     category_filter = set(enabled_categories) if enabled_categories else None
 
-    eligible = [
-        q for q in pool
-        if (type_filter is None or q.get("question_type") in type_filter)
-        and (category_filter is None or q.get("category") in category_filter)
-    ]
+    # Per-call RNG seeded from OS entropy — varied selections on re-practice
+    # WITHOUT touching global random state (no global seeding).
+    rng = random.Random()
+
+    # ── Filter, relaxing the most specific dimensions until we have enough ──
+    # Active relaxable filters, most-specific first. enabled_types/categories are
+    # deliberately absent here: they are scope, not relaxable preferences.
+    active = {
+        "aircraft_type": aircraft_type,
+        "experience": experience,
+        "airline": airline,
+        "difficulty": difficulty,
+    }
+    relax_order = ["aircraft_type", "experience", "airline", "difficulty"]
+
+    while True:
+        eligible = [
+            q for q in pool
+            if _question_matches(
+                q,
+                type_filter=type_filter,
+                category_filter=category_filter,
+                difficulty=active["difficulty"],
+                airline=active["airline"],
+                aircraft_type=active["aircraft_type"],
+                experience=active["experience"],
+            )
+        ]
+        if len(eligible) >= num_questions:
+            break
+        # Not enough — relax the next still-active specific filter, if any.
+        for dim in relax_order:
+            if active[dim] is not None:
+                active[dim] = None
+                break
+        else:
+            break  # nothing left to relax; take what we have
+
     if not eligible:
         raise ValueError("No questions match the requested type/category filters.")
 
@@ -82,12 +250,12 @@ def select_questions(
     for q in eligible:
         by_type[q.get("question_type")].append(q)
     for group in by_type.values():
-        random.shuffle(group)
+        rng.shuffle(group)
 
     # Shuffle the type ORDER too, so the "remainder" questions (when num_questions
     # doesn't divide evenly) don't always favor the same alphabetical type.
     types = list(by_type.keys())
-    random.shuffle(types)
+    rng.shuffle(types)
 
     total_available = len(eligible)
     target = min(num_questions, total_available)  # never crash on > available
@@ -116,7 +284,7 @@ def select_questions(
 
     # ── Shuffle final order, then assign 1..N. Copy each dict so we never
     # mutate the caller's pool with our "order" field. ──
-    random.shuffle(selected)
+    rng.shuffle(selected)
     return [{**q, "order": i} for i, q in enumerate(selected, start=1)]
 
 

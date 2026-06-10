@@ -50,6 +50,8 @@ from app.session import (
     SessionError,
     create_session_token,
     question_in_session,
+    resolve_difficulty,
+    resolve_interview_type,
     select_questions,
     verify_session_token,
 )
@@ -160,18 +162,41 @@ async def session_start(
 ) -> SessionStartResponse:
     cfg = app.state.config
 
+    # ── Interview type → backend question_types (Phase A1) ──
+    # Recognised-but-unwired types get a clean "not available" answer, never
+    # questions and never a 500. Unknown values fall through as "no filter".
+    it_status, mapped_types = resolve_interview_type(body.interview_type)
+    if it_status == "not_available":
+        raise api_error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "interview_type_unavailable",
+            f"The '{body.interview_type}' interview type is not yet available.",
+        )
+
     # Request filters override config filters when provided.
     enabled_types = cfg.get("enabled_question_types") or None
+    if mapped_types is not None:  # interview_type wins over the config default
+        enabled_types = mapped_types
+
     enabled_categories = cfg.get("enabled_categories") or None
     if body.category:
         enabled_categories = [body.category]
 
+    # Screen difficulty band → backend value (legacy values pass through; unknown
+    # → None). question_count overrides the admin default when provided.
+    difficulty = resolve_difficulty(body.difficulty)
+    num_questions = body.question_count or cfg["num_questions"]
+
     try:
         questions = select_questions(
             app.state.questions,
-            cfg["num_questions"],
+            num_questions,
             enabled_types=enabled_types,
             enabled_categories=enabled_categories,
+            difficulty=difficulty,
+            airline=body.airline,
+            aircraft_type=body.aircraft_type,
+            experience=body.experience,
         )
     except ValueError as exc:
         raise api_error(status.HTTP_400_BAD_REQUEST, "no_questions", str(exc))
@@ -279,7 +304,17 @@ async def session_complete(
         except Exception:  # noqa: BLE001 — best-effort persistence, never fatal
             logger.exception("Failed to persist interview for user %s", user_id)
 
-    return SessionCompleteResponse(**report)
+    # POST-INTERVIEW: attach each question's reference answer (the bank's existing
+    # `answer` field) keyed by question_id. Safe to reveal now that scoring is
+    # done; this is the ONLY place answers ever leave the server. May be None for
+    # questions that have no single model answer (e.g. behavioral).
+    model_answers = {
+        qid: (app.state.question_index.get(qid) or {}).get("answer")
+        for qid in (r.get("question_id") for r in results)
+        if qid
+    }
+
+    return SessionCompleteResponse(**report, model_answers=model_answers)
 
 
 # ─────────────────────────────────────────────────────────

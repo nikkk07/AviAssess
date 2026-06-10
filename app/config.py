@@ -43,8 +43,11 @@ class Settings(BaseSettings):
 
     # ─────────────────────────────────────────────
     # Data sources (local for dev; swappable for R2 in Phase 5).
+    # Defaults to the bundled question bank (app/data/question_bank.json). The
+    # smaller tests/fixtures/sample_qa.json is kept for the test suite — point
+    # QUESTIONS_PATH at it via the environment when running fixture-based tests.
     # ─────────────────────────────────────────────
-    QUESTIONS_PATH: str = "tests/fixtures/sample_qa.json"
+    QUESTIONS_PATH: str = "app/data/question_bank.json"
     CONFIG_PATH: str = "config.json"
 
     # ─────────────────────────────────────────────

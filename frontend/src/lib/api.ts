@@ -53,6 +53,9 @@ export interface SessionReport {
   num_questions: number;
   num_skipped: number;
   per_question: Array<{ question_id: string; final_score: number; band: string }>;
+  // Post-interview reference answers, keyed by question_id (may be null per
+  // question). Populated by the finalize endpoint once the interview is over.
+  model_answers?: Record<string, string | null>;
 }
 
 export interface AnswerPayload {
@@ -150,15 +153,48 @@ export function devLogin(code: string): Promise<{ access_token: string }> {
   return call("/api/dev/login", { method: "POST", body: { code } });
 }
 
+/**
+ * Configuration for a session start. Every field is optional — omit any and the
+ * backend draws from everything (Phase A1 accepts these and treats unknown/absent
+ * values leniently). `interview_type` / `difficulty` are backend param strings
+ * (e.g. "technical", "standard"), already mapped from the UI labels.
+ */
+export interface SessionConfig {
+  category?: string | null;
+  difficulty?: string | null;
+  interview_type?: string | null;
+  airline?: string | null;
+  aircraft_type?: string | null;
+  experience?: string | null;
+  question_count?: number | null;
+}
+
 /** Begin a session → { session_token, questions, issued_at }. */
 export function startSession(
   token: string,
-  { category, difficulty }: { category?: string | null; difficulty?: string | null } = {}
+  config: SessionConfig = {}
 ): Promise<StartSessionResponse> {
+  const {
+    category,
+    difficulty,
+    interview_type,
+    airline,
+    aircraft_type,
+    experience,
+    question_count,
+  } = config;
   return call("/api/session/start", {
     method: "POST",
     token,
-    body: { category: category ?? null, difficulty: difficulty ?? null },
+    body: {
+      category: category ?? null,
+      difficulty: difficulty ?? null,
+      interview_type: interview_type ?? null,
+      airline: airline ?? null,
+      aircraft_type: aircraft_type ?? null,
+      experience: experience ?? null,
+      question_count: question_count ?? null,
+    },
   });
 }
 

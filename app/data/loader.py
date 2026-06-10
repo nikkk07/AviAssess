@@ -7,12 +7,32 @@ WHY this module exists (and why it's deliberately thin):
     file access behind these three functions, the swap to an R2-backed
     implementation changes ONLY this module — callers (main.py) keep calling
     load_questions() / load_config() / save_config() unchanged.
+
+QUESTION-BANK JSON SCHEMA (what load_questions() expects):
+    The file is a non-empty JSON ARRAY of question objects. Full field-by-field
+    contract — including which fields are REQUIRED for scoring — lives in
+    docs/QUESTION_SCHEMA.md. Quick reference:
+
+      Core            : id, question, question_type (technical|behavioral|
+                        situational), category, difficulty (basic|intermediate|
+                        advanced), time_limit_seconds
+      Optional tags   : interview_type, airline, aircraft_type, experience
+                        (a question LACKING a tag matches ANY requested value)
+      Scoring (req'd) : essential_keywords + supporting_keywords  → technical
+                        model_answer (or relevance_keywords)       → HR/relevance
+
+    A question missing its scoring fields is still SERVED but cannot be
+    meaningfully scored. See docs/QUESTION_SCHEMA.md before adding a dataset.
 """
 
 import json
+import logging
 from pathlib import Path
 
 from app.config import settings
+
+
+logger = logging.getLogger("aviassess.loader")
 
 
 # Sensible defaults used when no config.json exists yet.
@@ -24,13 +44,55 @@ DEFAULT_CONFIG: dict = {
 }
 
 
+# Fields every question row MUST carry to be usable for serving + scoring. The
+# KEY must be present; `answer` MAY be null (behavioral/situational items often
+# have no single model answer). The optional interview tags (interview_type,
+# airline, aircraft_type, experience) are NOT required and may be null.
+REQUIRED_FIELDS: tuple[str, ...] = (
+    "id",
+    "question",
+    "question_type",
+    "answer",
+    "essential_keywords",
+    "supporting_keywords",
+    "category",
+    "difficulty",
+    "time_limit_seconds",
+)
+
+
+def _is_valid_question(row: object, index: int) -> bool:
+    """
+    True if `row` is a well-formed question. Malformed rows are LOGGED and the
+    caller skips them — one bad row must never crash the whole pool.
+    """
+    if not isinstance(row, dict):
+        logger.warning("Skipping question at index %d: not a JSON object.", index)
+        return False
+    # Presence check only (value may legitimately be null, e.g. `answer`).
+    missing = [f for f in REQUIRED_FIELDS if f not in row]
+    if missing:
+        logger.warning(
+            "Skipping question %r (index %d): missing required field(s): %s",
+            row.get("id", "<no id>"), index, ", ".join(missing),
+        )
+        return False
+    return True
+
+
 def load_questions() -> list[dict]:
     """
     Load the full question pool (with answers + keywords) from QUESTIONS_PATH.
 
+    Each row is validated against REQUIRED_FIELDS; rows missing a required field
+    (or that aren't JSON objects) are LOGGED and SKIPPED rather than crashing the
+    load. Optional interview tags (interview_type/airline/aircraft_type/
+    experience) are allowed and may be null. The expected file shape is a plain
+    JSON ARRAY — see the schema note at the top of this module.
+
     Raises:
         FileNotFoundError: if the path doesn't exist.
-        ValueError:        if the file isn't a non-empty JSON list.
+        ValueError:        if the file isn't a JSON list, or NO valid rows remain.
     """
     path = Path(settings.QUESTIONS_PATH)
     if not path.exists():
@@ -43,7 +105,21 @@ def load_questions() -> list[dict]:
             f"Questions file must be a non-empty JSON list: {path}"
         )
 
-    return data
+    valid = [row for i, row in enumerate(data) if _is_valid_question(row, i)]
+
+    skipped = len(data) - len(valid)
+    if skipped:
+        logger.warning(
+            "Loaded %d of %d questions from %s (%d skipped as malformed).",
+            len(valid), len(data), path, skipped,
+        )
+
+    if not valid:
+        raise ValueError(
+            f"No valid questions found in {path} — every row was malformed."
+        )
+
+    return valid
 
 
 def load_config() -> dict:

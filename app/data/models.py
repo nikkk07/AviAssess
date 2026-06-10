@@ -99,10 +99,54 @@ class QuestionPublic(BaseModel):
 # 3-4. Session start
 # ─────────────────────────────────────────────────────────
 class SessionStartRequest(BaseModel):
-    """Begin a session. All filters optional — omit to draw from everything."""
+    """
+    Begin a session. EVERY filter is optional — omit to draw from everything.
+
+    Two ways to configure a session, fully backward compatible:
+      * LEGACY: send `category` and/or `difficulty` (difficulty values like
+        "intermediate") — behaves exactly as before for old callers.
+      * INTERVIEW (Phase A1): send `interview_type` plus optional `airline`,
+        `aircraft_type`, `experience`, a screen `difficulty` band
+        (friendly/standard/tough), and `question_count`.
+
+    LENIENT VALIDATION (deliberate): the new dimensions are plain strings, NOT
+    strict enums. An unrecognised `interview_type` / `difficulty` value is treated
+    as "no filter" rather than rejected — the API must never 500 (or even 422) on
+    a stray value coming from an evolving frontend. The ONE exception is the
+    recognised-but-unwired interview types (sim_check_debrief, group_exercise),
+    which the endpoint answers with an explicit "not yet available" response.
+    """
 
     category: Optional[str] = Field(default=None, examples=["aerodynamics"])
-    difficulty: Optional[str] = Field(default=None, examples=["intermediate"])
+    difficulty: Optional[str] = Field(
+        default=None, examples=["standard"],
+        description="Screen band (friendly/standard/tough) OR a legacy backend "
+                    "value (basic/intermediate/advanced). Unknown → no filter.",
+    )
+
+    # ── Phase A1: interview-configured selection (all optional) ──
+    interview_type: Optional[str] = Field(
+        default=None, examples=["technical"],
+        description="One of hr_personal | technical | sim_check_debrief | "
+                    "group_exercise. Unknown values are treated as no filter.",
+    )
+    airline: Optional[str] = Field(
+        default=None, examples=["BA"],
+        description="Optional airline tag. Questions lacking the tag match any value.",
+    )
+    aircraft_type: Optional[str] = Field(
+        default=None, examples=["A320"],
+        description="Optional aircraft-type tag. Untagged questions match any value.",
+    )
+    experience: Optional[str] = Field(
+        default=None, examples=["cadet"],
+        description="Optional experience tag. Untagged questions match any value.",
+    )
+    question_count: Optional[int] = Field(
+        default=None, ge=1, examples=[8],
+        description="How many questions the session contains (e.g. 5 | 8 | 12). "
+                    "Absent → fall back to the admin-configured num_questions.",
+    )
 
 
 class SessionStartResponse(BaseModel):
@@ -211,6 +255,22 @@ class SessionCompleteResponse(BaseModel):
     num_skipped: int = Field(ge=0, examples=[1])
     per_question: list[PerQuestionSummary]
     summary: str = Field(examples=["Strong overall, with room to sharpen technical depth."])
+
+    # POST-INTERVIEW reveal of each question's reference answer, keyed by
+    # question_id. This is safe ONLY here (the interview is over) — model answers
+    # are NEVER part of QuestionPublic or any pre-completion response. The value
+    # is the question bank's existing `answer` field and may be None (e.g.
+    # behavioral questions have no single model answer). Answer QUALITY depends on
+    # the Phase B dataset populating good `answer` text.
+    model_answers: dict[str, Optional[str]] = Field(
+        default_factory=dict,
+        examples=[{"q025": "Aerodynamics is the study of how air moves..."}],
+        description="Per-question reference answers, keyed by question_id (post-interview only).",
+    )
+
+    # "model_answers" starts with "model_", colliding with Pydantic's protected
+    # namespace; silence that warning explicitly (same pattern as HealthResponse).
+    model_config = ConfigDict(protected_namespaces=())
 
 
 # ─────────────────────────────────────────────────────────
