@@ -63,3 +63,6 @@ uvicorn
 # Deliberately NO SQLAlchemy / supabase-py / boto3: this service runs in 512MB
 # and we just validated the fit, so we keep the dependency footprint minimal.
 asyncpg==0.30.0
+
+# Keep-alive self-ping (prevents Render free-tier spin-down).
+requests==2.31.0

@@ -46,6 +46,7 @@ from app.reports.generator import aggregate_report
 from app.scoring.engine import score_response
 from app.scoring.semantic import get_model
 from app.storage import db
+from app.keepalive import start_keepalive, stop_keepalive
 from app.session import (
     SessionError,
     create_session_token,
@@ -71,7 +72,14 @@ async def lifespan(app: FastAPI):
     app.state.config = load_config()
     app.state.question_index = {q["id"]: q for q in app.state.questions}
 
+    # Start keep-alive pings to prevent Render free-tier spin-down.
+    start_keepalive()
+
     yield
+
+    # Shutdown: stop keep-alive thread and close DB pool.
+    stop_keepalive()
+    await db.close_pool()
 
     # Close the DB pool if persistence ever opened one (no-op when DB-less).
     await db.close_pool()
